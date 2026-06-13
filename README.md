@@ -54,7 +54,7 @@ cp .env.example .env
    - `im:write`    (lets it open a DM with you)
 4. Scroll up → **Install to Workspace** → **Allow**.
 5. Copy the **Bot User OAuth Token** (starts with `xoxb-`) → paste into `.env`
-   as `SLACK_BOT_TOKEN`.
+   as `SLACK_MORNING_TASKS_DIGEST_BOT_TOKEN`.
 
 > v1 needs **only** the bot token. No Socket Mode, no user token, no app token.
 > (Those come back if/when we add *reading* your Slack messages.)

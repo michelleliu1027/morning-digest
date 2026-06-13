@@ -55,11 +55,11 @@ def build_digest() -> str:
 
 
 def send_to_slack(text: str) -> None:
-    token = os.environ.get("SLACK_BOT_TOKEN")
+    token = os.environ.get("SLACK_MORNING_TASKS_DIGEST_BOT_TOKEN")
     user_id = os.environ.get("MY_SLACK_USER_ID")
     if not token or not user_id:
         raise SystemExit(
-            "Missing SLACK_BOT_TOKEN or MY_SLACK_USER_ID. "
+            "Missing SLACK_MORNING_TASKS_DIGEST_BOT_TOKEN or MY_SLACK_USER_ID. "
             "Copy .env.example to .env and fill them in."
         )
     client = WebClient(token=token)
