@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 from slack_sdk import WebClient
 
 from .prompt import DIGEST_PROMPT
+from .slack_format import to_slack_mrkdwn
 
 load_dotenv()
 
@@ -64,7 +65,11 @@ def send_to_slack(text: str) -> None:
         )
     client = WebClient(token=token)
     # Posting to a user ID opens (or reuses) the DM with that user.
-    client.chat_postMessage(channel=user_id, text=text, unfurl_links=False)
+    client.chat_postMessage(
+        channel=user_id,
+        text=to_slack_mrkdwn(text),
+        unfurl_links=False,
+    )
 
 
 def main() -> None:
