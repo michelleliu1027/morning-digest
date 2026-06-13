@@ -1,0 +1,21 @@
+[project]
+name = "morning-digest"
+version = "0.1.0"
+description = "A morning to-do digest: Claude gathers Notion tasks + GitHub PRs and DMs you a summary on Slack."
+requires-python = ">=3.11"
+dependencies = [
+    "slack-sdk>=3.27.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.1.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"

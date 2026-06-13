@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS Launch Agent for morning-digest.
+
+  BEFORE INSTALLING, replace these placeholders below:
+    /ABSOLUTE/PATH/TO/morning-digest   -> the absolute path to your clone of this repo
+    /ABSOLUTE/PATH/TO/.venv/bin/python -> the python inside that repo's .venv
+
+  Install:
+    cp launchd/com.morning-digest.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.morning-digest.plist
+  Reload after edits:
+    launchctl unload ~/Library/LaunchAgents/com.morning-digest.plist
+    launchctl load   ~/Library/LaunchAgents/com.morning-digest.plist
+
+  Runs at 8:00 AM daily. RunAtLoad also fires it at login (so if the Mac was
+  asleep at 8am, you still get a digest when you sit down).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.morning-digest</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/ABSOLUTE/PATH/TO/.venv/bin/python</string>
+        <string>-m</string>
+        <string>morning_digest</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/ABSOLUTE/PATH/TO/morning-digest</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Ensure claude + gh are findable. Adjust if yours live elsewhere. -->
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>8</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/ABSOLUTE/PATH/TO/morning-digest/digest_output/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/ABSOLUTE/PATH/TO/morning-digest/digest_output/stderr.log</string>
+</dict>
+</plist>
