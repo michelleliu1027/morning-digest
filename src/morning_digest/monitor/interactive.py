@@ -20,6 +20,8 @@ from __future__ import annotations
 import os
 import threading
 import time
+from datetime import date, datetime
+from pathlib import Path
 
 from dotenv import load_dotenv
 from slack_bolt import App
@@ -34,6 +36,13 @@ BOT_TOKEN_ENV = "SLACK_MORNING_TASKS_DIGEST_BOT_TOKEN"
 APP_TOKEN_ENV = "SLACK_MORNING_TASKS_DIGEST_APP_TOKEN"
 
 DASHBOARD_URL = f"http://127.0.0.1:{PORT}"
+
+# Hour (local) at/after which the daily digest is posted once. The listener is a
+# persistent process, so a marker file records the last date it posted — this
+# survives restarts (login, crash) so you get exactly one digest per day.
+DIGEST_HOUR = int(os.environ.get("DIGEST_HOUR", "8"))
+_STATE_DIR = Path(__file__).resolve().parents[3] / "digest_output"
+_LAST_SENT_FILE = _STATE_DIR / ".last_digest_date"
 
 # Demo task set. Later these are generated from the digest; the shape is what matters.
 DEMO_TASKS = [
@@ -66,6 +75,11 @@ DEMO_TASKS = [
 
 _TASKS: dict[str, Task] = {t.id: t for t in DEMO_TASKS}
 
+# The posted task message, so we can chat_update it in place as tasks progress.
+# Keyed by the message ts: {"channel": str, "blocks": list[dict]}.
+_MSG: dict[str, dict] = {}
+_MSG_LOCK = threading.Lock()
+
 
 def _task_blocks(tasks: list[Task]) -> list[dict]:
     """Build Slack Block Kit blocks: a header + one section+buttons per task."""
@@ -93,6 +107,35 @@ def _task_blocks(tasks: list[Task]) -> list[dict]:
     return blocks
 
 
+def _set_task_status(client, message_ts: str, task_id: str, status_md: str) -> None:
+    """Rewrite one task row's buttons into a status line, in place via chat_update.
+
+    The buttons live in an `actions` block with block_id `task_<id>`; we swap that
+    block for a `context` block (e.g. "⏳ Running… · watch live") so a tapped task
+    no longer shows Do this / Skip.
+    """
+    with _MSG_LOCK:
+        rec = _MSG.get(message_ts)
+        if not rec:
+            return
+        new_blocks = []
+        for b in rec["blocks"]:
+            if b.get("type") == "actions" and b.get("block_id") == f"task_{task_id}":
+                new_blocks.append({
+                    "type": "context", "block_id": f"task_{task_id}",
+                    "elements": [{"type": "mrkdwn", "text": status_md}],
+                })
+            else:
+                new_blocks.append(b)
+        rec["blocks"] = new_blocks
+        channel, blocks = rec["channel"], list(new_blocks)
+    try:
+        client.chat_update(channel=channel, ts=message_ts, blocks=blocks,
+                           text="Today's tasks")
+    except Exception as exc:  # noqa: BLE001 - status is cosmetic; never crash a click
+        print(f"[interactive] chat_update failed: {exc}")
+
+
 def build_app() -> App:
     app = App(token=os.environ[BOT_TOKEN_ENV])
 
@@ -100,12 +143,7 @@ def build_app() -> App:
     def handle_skip(ack, body, client):
         ack()
         tid = body["actions"][0]["value"]
-        task = _TASKS.get(tid)
-        client.chat_postMessage(
-            channel=body["channel"]["id"],
-            thread_ts=body["message"]["ts"],
-            text=f"⏭️ Skipped: {task.title if task else tid}",
-        )
+        _set_task_status(client, body["message"]["ts"], tid, "⏭️ *Skipped*")
 
     @app.action("do_task")
     def handle_do(ack, body, client):
@@ -121,6 +159,8 @@ def build_app() -> App:
 
         agent = spawn_agent(name=task.title, prompt=task.agent_prompt,
                             cwd=task.cwd, gate=task.gate)
+        _set_task_status(client, thread_ts, tid,
+                         f"⏳ *Running…* · <{DASHBOARD_URL}|watch live>")
         client.chat_postMessage(
             channel=channel, thread_ts=thread_ts,
             text=f"🚀 Started: *{task.title}*\nWatch it work → {DASHBOARD_URL}\n_({task.gate_label})_",
@@ -128,14 +168,15 @@ def build_app() -> App:
         # Watch the agent and post the outcome back to this thread when it finishes.
         threading.Thread(
             target=_report_when_done,
-            args=(client, channel, thread_ts, agent.id, task),
+            args=(client, channel, thread_ts, agent.id, task, tid),
             daemon=True,
         ).start()
 
     return app
 
 
-def _report_when_done(client, channel: str, thread_ts: str, agent_id: str, task: Task) -> None:
+def _report_when_done(client, channel: str, thread_ts: str, agent_id: str,
+                      task: Task, tid: str | None = None) -> None:
     # Terminal states differ by gate: a code task first parks in awaiting_approval
     # (the diff is ready for review) before it can reach done. It may instead land
     # in needs_input — it didn't actually finish and wants a human correction.
@@ -150,15 +191,33 @@ def _report_when_done(client, channel: str, thread_ts: str, agent_id: str, task:
             announced_diff = announced_input = False
         if agent.status == "awaiting_approval" and not announced_diff:
             announced_diff = True
-            target = (agent.diff or {}).get("target", "")
-            client.chat_postMessage(
-                channel=channel, thread_ts=thread_ts,
-                text=f"✋ *{task.title}* — change is ready. Review the diff in the "
-                     f"dashboard before committing:\n{DASHBOARD_URL}\n_Target: {target}_",
-            )
+            if task.gate == "draft":
+                n = len(agent.drafts or [])
+                if tid:
+                    _set_task_status(client, thread_ts, tid,
+                                     f"✋ *{n} draft comment(s)* — <{DASHBOARD_URL}|approve each>")
+                client.chat_postMessage(
+                    channel=channel, thread_ts=thread_ts,
+                    text=f"✋ *{task.title}* — {n} draft comment(s) ready. Nothing is "
+                         f"posted yet; approve each one in the dashboard to post it to "
+                         f"the PR:\n{DASHBOARD_URL}",
+                )
+            else:
+                target = (agent.diff or {}).get("target", "")
+                if tid:
+                    _set_task_status(client, thread_ts, tid,
+                                     f"✋ *Diff ready* — <{DASHBOARD_URL}|review & commit>")
+                client.chat_postMessage(
+                    channel=channel, thread_ts=thread_ts,
+                    text=f"✋ *{task.title}* — change is ready. Review the diff in the "
+                         f"dashboard before committing:\n{DASHBOARD_URL}\n_Target: {target}_",
+                )
             continue  # keep watching: she'll approve/reject in the dashboard
         if agent.status == "needs_input" and not announced_input:
             announced_input = True
+            if tid:
+                _set_task_status(client, thread_ts, tid,
+                                 f"✋ *Needs input* — <{DASHBOARD_URL}|review & re-run>")
             client.chat_postMessage(
                 channel=channel, thread_ts=thread_ts,
                 text=f"✋ *{task.title}* — this did NOT finish cleanly: {agent.note}\n"
@@ -168,6 +227,13 @@ def _report_when_done(client, channel: str, thread_ts: str, agent_id: str, task:
             continue  # she may re-run with a hint; keep watching for the real outcome
         if agent.status in ("done", "failed"):
             break
+
+    if tid:
+        elapsed = agent.public()["elapsed"]
+        if agent.status == "done":
+            _set_task_status(client, thread_ts, tid, f"✅ *Done* · {elapsed}s")
+        else:
+            _set_task_status(client, thread_ts, tid, f"❌ *Failed* · {elapsed}s")
 
     final = agent.latest() or {}
     summary = final.get("text", "")
@@ -189,11 +255,15 @@ def post_tasks(app: App, tasks: list[Task] | None = None) -> None:
     tasks = tasks or DEMO_TASKS
     for t in tasks:
         _TASKS[t.id] = t
-    app.client.chat_postMessage(
+    blocks = _task_blocks(tasks)
+    resp = app.client.chat_postMessage(
         channel=os.environ["MY_SLACK_USER_ID"],
-        blocks=_task_blocks(tasks),
+        blocks=blocks,
         text="Today's tasks (tap a button to run)",
     )
+    # Remember the message so each click can chat_update its task row in place.
+    with _MSG_LOCK:
+        _MSG[resp["ts"]] = {"channel": resp["channel"], "blocks": blocks}
 
 
 def post_live_digest(app: App, mode: str | None = None) -> None:
@@ -235,6 +305,37 @@ def post_live_digest(app: App, mode: str | None = None) -> None:
         print("[interactive] digest had no actionable tasks; no buttons posted.")
 
 
+def _already_sent_today() -> bool:
+    try:
+        return _LAST_SENT_FILE.read_text().strip() == date.today().isoformat()
+    except FileNotFoundError:
+        return False
+
+
+def _mark_sent_today() -> None:
+    _STATE_DIR.mkdir(parents=True, exist_ok=True)
+    _LAST_SENT_FILE.write_text(date.today().isoformat())
+
+
+def _daily_scheduler(app: App, mode: str | None) -> None:
+    """Post the digest once per day at/after DIGEST_HOUR, guarded by a marker file.
+
+    Runs forever in a background thread. Because the listener is persistent, this
+    replaces v1's one-shot launchd run: if the Mac was asleep at 8am, the digest
+    goes out when this catches up — and never twice in one day.
+    """
+    while True:
+        now = datetime.now()
+        if now.hour >= DIGEST_HOUR and not _already_sent_today():
+            try:
+                post_live_digest(app, mode=mode)
+                _mark_sent_today()
+                print(f"[interactive] daily digest posted at {now:%H:%M}.")
+            except Exception as exc:  # noqa: BLE001 - keep the listener alive
+                print(f"[interactive] digest failed: {exc}")
+        time.sleep(300)  # check every 5 minutes
+
+
 def main() -> None:
     import argparse
 
@@ -243,6 +344,12 @@ def main() -> None:
                         help="Post the hardcoded demo tasks instead of a live digest.")
     parser.add_argument("--mode", choices=["daily", "weekly"], default=None,
                         help="Force digest mode (default: auto by weekday).")
+    parser.add_argument("--now", action="store_true",
+                        help="Post a digest immediately on start (for testing), "
+                             "in addition to the daily schedule.")
+    parser.add_argument("--no-schedule", action="store_true",
+                        help="Skip the daily scheduler; just listen for clicks "
+                             "(use with --now or --demo for a one-off test).")
     args = parser.parse_args()
 
     for env in (BOT_TOKEN_ENV, APP_TOKEN_ENV, "MY_SLACK_USER_ID"):
@@ -254,11 +361,21 @@ def main() -> None:
     time.sleep(0.5)
 
     app = build_app()
+
+    # Optional immediate post (testing or a manual kick).
     if args.demo:
         post_tasks(app)
-    else:
+    elif args.now:
         post_live_digest(app, mode=args.mode)
-    print(f"[interactive] posted to Slack. Dashboard: {DASHBOARD_URL}")
+        _mark_sent_today()
+
+    # The persistent daily scheduler is what replaces v1's launchd one-shot.
+    if not args.no_schedule:
+        threading.Thread(target=_daily_scheduler, args=(app, args.mode),
+                         daemon=True).start()
+        print(f"[interactive] daily scheduler armed (posts at/after {DIGEST_HOUR}:00).")
+
+    print(f"[interactive] dashboard: {DASHBOARD_URL}")
     print("[interactive] listening for button clicks (Ctrl-C to stop)…")
     SocketModeHandler(app, os.environ[APP_TOKEN_ENV]).start()
 

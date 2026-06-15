@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS Launch Agent for morning-digest v2 (interactive listener).
+
+  Unlike the v1 one-shot (com.morning-digest.plist), this is a PERSISTENT
+  process: it holds a Slack Socket Mode connection + the local dashboard so it
+  can handle ✅/⏭️ button clicks at any time, and it posts the daily digest
+  itself (once per day at/after DIGEST_HOUR — see interactive._daily_scheduler).
+
+  Use EITHER this plist OR the v1 one-shot, not both (they would double-post).
+
+  BEFORE INSTALLING, replace these placeholders below:
+    /ABSOLUTE/PATH/TO/morning-digest   -> the absolute path to your clone of this repo
+    /ABSOLUTE/PATH/TO/.venv/bin/python -> the python inside that repo's .venv
+
+  Install:
+    cp launchd/com.morning-digest.interactive.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.morning-digest.interactive.plist
+  Reload after edits:
+    launchctl unload ~/Library/LaunchAgents/com.morning-digest.interactive.plist
+    launchctl load   ~/Library/LaunchAgents/com.morning-digest.interactive.plist
+
+  KeepAlive restarts it if it crashes; RunAtLoad starts it at login. While the
+  laptop is open the listener stays up; the digest posts once per day.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.morning-digest.interactive</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/ABSOLUTE/PATH/TO/.venv/bin/python</string>
+        <string>-m</string>
+        <string>morning_digest.monitor.interactive</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/ABSOLUTE/PATH/TO/morning-digest</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Ensure claude + gh are findable. Adjust if yours live elsewhere. -->
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/ABSOLUTE/PATH/TO/morning-digest/digest_output/interactive-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/ABSOLUTE/PATH/TO/morning-digest/digest_output/interactive-stderr.log</string>
+</dict>
+</plist>

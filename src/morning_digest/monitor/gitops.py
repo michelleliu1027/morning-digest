@@ -107,3 +107,25 @@ def discard(cwd: str, label: str) -> CommitResult:
     if code != 0:
         return CommitResult(False, f"git stash failed: {out}")
     return CommitResult(True, f"discarded — stashed as `{label}` (recover with `git stash list`).")
+
+
+def pr_url(cwd: str, pr: int) -> str | None:
+    """Resolve the web URL for a PR number, for linking in Slack/dashboard."""
+    code, out = _run(["gh", "pr", "view", str(pr), "--json", "url", "--jq", ".url"], cwd)
+    if code == 0 and out.strip().startswith("http"):
+        return out.strip()
+    return None
+
+
+def post_pr_comment(cwd: str, pr: int, body: str) -> CommitResult:
+    """Post ONE approved comment to a PR via `gh pr comment` (never auto-called).
+
+    This is the only place the bot writes to a PR, and it runs solely after the
+    user approves that specific draft in the dashboard — the draft agent itself
+    has no comment/review tools at all.
+    """
+    code, out = _run(["gh", "pr", "comment", str(pr), "--body", body], cwd)
+    if code != 0:
+        return CommitResult(False, f"posting comment to #{pr} failed: {out}")
+    url = out.strip() if out.strip().startswith("http") else None
+    return CommitResult(True, f"posted comment to #{pr}.", pr_url=url)

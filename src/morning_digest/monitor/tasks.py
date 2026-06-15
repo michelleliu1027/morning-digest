@@ -28,6 +28,24 @@ from dataclasses import dataclass
 # machine-readable task list (see prompt._ACTIONS_BLOCK).
 TASKS_MARKER = "<<<TASKS>>>"
 
+# Prepended to EVERY task regardless of gate. The spawned `claude -p` also loads
+# the global ~/.claude/CLAUDE.md (which carries this rule), but that is a soft
+# hint the agent may skip if it misjudges a task as unrelated. Repeating it here,
+# in the task prompt itself, makes consulting the personal knowledge base a hard
+# step — the same pattern the code/draft preambles use to force a tool action.
+BRAIN_PREAMBLE = (
+    "BEFORE you start, consult the user's personal knowledge base (the "
+    "\"claude-brain\" Obsidian vault at ~/claude-brain) — it is the source of "
+    "truth for her prior investigations, data models, dashboards, and SOPs "
+    "(especially marketing attribution, AppsFlyer, ad-spend pipelines, dbt):\n"
+    "  1. `grep` ~/claude-brain/INDEX.md for keywords from this task.\n"
+    "  2. Read each matching note under ~/claude-brain/notes/ or ~/claude-brain/refs/.\n"
+    "  3. Follow its [[wikilinks]] to related notes for fuller context.\n"
+    "If a search turns up nothing relevant, say so briefly and proceed — but you "
+    "must actually look first rather than assume. This vault is private and "
+    "local-only: never copy its contents into a PR, commit, or any shared place.\n\n"
+)
+
 # Prepended to every "code" task. Tells the writer to pick the right branch and
 # STOP before committing — the diff-preview → approve → commit gate lives in the
 # server (the writer toolset has no commit/push), so this just steers placement.
@@ -58,6 +76,23 @@ CODE_PREAMBLE = (
 )
 
 
+# Prepended to every "draft" task. The agent reads the PR and writes draft
+# comments but CANNOT post them (it has no comment/review tools). It must emit a
+# <<<COMMENTS>>> JSON block the dashboard turns into per-item approve buttons.
+DRAFT_PREAMBLE = (
+    "You are drafting PR feedback for a human to review and approve. You do NOT "
+    "have any tool to post comments, submit reviews, or merge — and you must not "
+    "try. Read the PR (gh pr view / gh pr diff) and write your review.\n\n"
+    "After your human-readable review, output a line containing only `<<<COMMENTS>>>` "
+    "followed by a JSON array of the individual comments you propose posting. Each "
+    "object: {\"pr\": <pr number as int>, \"body\": \"<the exact comment markdown>\"}. "
+    "Split distinct points into separate comments so the human can approve them one "
+    "at a time. If you have no comment worth posting, output `<<<COMMENTS>>>` then `[]`. "
+    "Output nothing after the JSON array.\n\n"
+    "--- TASK ---\n"
+)
+
+
 @dataclass
 class Task:
     id: str          # stable short id, used in the button's action value
@@ -76,8 +111,16 @@ class Task:
 
     @property
     def agent_prompt(self) -> str:
-        """The prompt actually sent to the agent (code tasks get the placement preamble)."""
-        return CODE_PREAMBLE + self.prompt if self.gate == "code" else self.prompt
+        """The prompt actually sent to the agent.
+
+        Every gate first gets BRAIN_PREAMBLE (consult ~/claude-brain), then its
+        own gate preamble (code/draft), then the task itself.
+        """
+        if self.gate == "code":
+            return BRAIN_PREAMBLE + CODE_PREAMBLE + self.prompt
+        if self.gate == "draft":
+            return BRAIN_PREAMBLE + DRAFT_PREAMBLE + self.prompt
+        return BRAIN_PREAMBLE + self.prompt
 
 
 _VALID_GATES = {"code", "draft", "readonly"}

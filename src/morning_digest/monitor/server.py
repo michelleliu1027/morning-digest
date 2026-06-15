@@ -16,7 +16,7 @@ Pure stdlib — no extra dependencies.
 from __future__ import annotations
 
 import json
-import shlex
+import re
 import subprocess
 import threading
 import time
@@ -26,13 +26,33 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from .events import ProgressEvent, parse_event
-from .gitops import capture_diff, commit_and_push, discard
+from .gitops import capture_diff, commit_and_push, discard, post_pr_comment
 
 HOST = "127.0.0.1"
 PORT = 8787
 
+# Read-only `gh` subcommands an analysis/draft agent may use. Deliberately a
+# per-subcommand allowlist (NOT the `gh *` wildcard) so the agent CANNOT post a
+# comment/review or merge — `gh pr comment`, `gh pr review`, `gh pr merge` and
+# the raw `gh api` escape hatch are simply not granted. The draft is data the
+# user approves; only the server posts it, after a click.
+_READONLY_GH = (
+    "Bash(gh pr view*) Bash(gh pr diff*) Bash(gh pr list*) Bash(gh pr checks*) "
+    "Bash(gh pr checkout*) Bash(gh search*) Bash(gh issue view*) Bash(gh issue list*) "
+    "Bash(gh repo view*)"
+)
+
 # Tools a read-only / analysis agent may use without prompting.
-DEFAULT_ALLOWED_TOOLS = "TodoWrite Bash(gh *) Bash(ls *) Bash(find *) mcp__notion__notion-search mcp__notion__notion-fetch"
+DEFAULT_ALLOWED_TOOLS = (
+    f"TodoWrite Read Grep {_READONLY_GH} "
+    "Bash(ls *) Bash(find *) Bash(cat *) Bash(grep *) Bash(git diff*) Bash(git log*) "
+    "mcp__notion__notion-search mcp__notion__notion-fetch"
+)
+
+# Draft agents (gate="draft") get the same read-only surface: they read a PR and
+# WRITE A DRAFT, but never post it. Same allowlist — the write happens only via
+# the server's post_pr_comment after the user approves each comment.
+DRAFT_ALLOWED_TOOLS = DEFAULT_ALLOWED_TOOLS
 
 # Tools the code WRITER may use. Deliberately EXCLUDES `git commit` / `git push`:
 # the agent edits files and picks the right branch, but committing only happens
@@ -65,6 +85,7 @@ class Agent:
     note: str = ""                    # why the agent needs human input (shown in dashboard)
     model: str = "opus"               # model to reuse on a --resume re-run
     allowed_tools: str = ""           # toolset to reuse on a --resume re-run
+    drafts: list[dict] | None = None  # draft PR comments awaiting per-item approval
 
     def latest(self) -> dict | None:
         return self.events[-1] if self.events else None
@@ -101,6 +122,7 @@ class Agent:
             "todos": self.todos(),
             "diff": self.diff,
             "note": self.note,
+            "drafts": self.drafts,
         }
 
 
@@ -154,6 +176,11 @@ class Registry:
             agent.note = note
         self._broadcast()
 
+    def set_drafts(self, agent: Agent, drafts: list[dict] | None) -> None:
+        with self._lock:
+            agent.drafts = drafts
+        self._broadcast()
+
     # --- SSE pub/sub ---
     def subscribe(self) -> "Queue":
         from queue import Queue
@@ -187,7 +214,10 @@ def spawn_agent(name: str, prompt: str, cwd: str = ".", model: str = "opus",
     agent in ``awaiting_approval`` — committing waits for the user's click.
     """
     if allowed_tools is None:
-        allowed_tools = WRITER_ALLOWED_TOOLS if gate == "code" else DEFAULT_ALLOWED_TOOLS
+        allowed_tools = {
+            "code": WRITER_ALLOWED_TOOLS,
+            "draft": DRAFT_ALLOWED_TOOLS,
+        }.get(gate, DEFAULT_ALLOWED_TOOLS)
     agent = Agent(id=uuid.uuid4().hex[:8], name=name, prompt=prompt,
                   cwd=str(Path(cwd).expanduser()), gate=gate)
     agent.allowed_tools = allowed_tools
@@ -241,6 +271,8 @@ def _run_agent(agent: Agent, prompt: str, resume_session: str | None = None) -> 
         return
     if agent.gate == "code":
         _finish_code_agent(agent)
+    elif agent.gate == "draft":
+        _finish_draft_agent(agent)
     else:
         REGISTRY.set_status(agent, "done")
 
@@ -380,6 +412,100 @@ def reject_diff(agent_id: str) -> dict:
     return {"ok": res.ok, "message": res.message}
 
 
+_COMMENTS_MARKER = "<<<COMMENTS>>>"
+_JSON_ARRAY_RE = re.compile(r"\[.*\]", re.DOTALL)
+
+
+def _parse_draft_comments(text: str) -> list[dict]:
+    """Pull the agent's `<<<COMMENTS>>>` JSON array of {pr, body} draft comments.
+
+    Each becomes a row in the dashboard the user approves one at a time. Bad or
+    missing JSON yields no drafts (the full text is still shown as Output/Draft).
+    """
+    if _COMMENTS_MARKER not in text:
+        return []
+    _, _, tail = text.partition(_COMMENTS_MARKER)
+    m = _JSON_ARRAY_RE.search(tail)
+    if not m:
+        return []
+    try:
+        items = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return []
+    drafts = []
+    for i, it in enumerate(items if isinstance(items, list) else []):
+        if not isinstance(it, dict) or not it.get("body"):
+            continue
+        pr = it.get("pr")
+        drafts.append({
+            "idx": i,
+            "pr": int(pr) if str(pr).isdigit() else None,
+            "body": str(it["body"]),
+            "status": "pending",   # pending | posted | discarded
+        })
+    return drafts
+
+
+def _finish_draft_agent(agent: Agent) -> None:
+    """A draft agent finished: park its draft comments for per-item approval.
+
+    Nothing is posted. If the agent produced structured draft comments, the
+    dashboard shows each with [Post to PR]/[Discard]; if not, it just shows the
+    full draft text. Either way the agent had no tools to post on its own.
+    """
+    drafts = _parse_draft_comments(agent.final_output())
+    if drafts:
+        REGISTRY.set_drafts(agent, drafts)
+        REGISTRY.push_event(agent, ProgressEvent(
+            "say", f"✋ {len(drafts)} draft comment(s) ready — approve each to post.", "✋"))
+        REGISTRY.set_status(agent, "awaiting_approval")
+    else:
+        # No structured comments; the draft text is in Output/Draft. Done (nothing to post).
+        REGISTRY.set_status(agent, "done")
+
+
+def post_draft_comment(agent_id: str, idx: int) -> dict:
+    """Post ONE approved draft comment to its PR (only after the user clicks)."""
+    agent = REGISTRY.get(agent_id)
+    if agent is None or not agent.drafts:
+        return {"ok": False, "error": "no drafts to post"}
+    draft = next((d for d in agent.drafts if d["idx"] == idx), None)
+    if draft is None:
+        return {"ok": False, "error": "draft not found"}
+    if draft["status"] != "pending":
+        return {"ok": False, "error": f"draft already {draft['status']}"}
+    if not draft["pr"]:
+        return {"ok": False, "error": "draft has no PR number"}
+    res = post_pr_comment(agent.cwd, draft["pr"], draft["body"])
+    draft["status"] = "posted" if res.ok else "pending"
+    REGISTRY.push_event(agent, ProgressEvent(
+        "done" if res.ok else "say", res.message, "✅" if res.ok else "❌"))
+    _settle_draft_agent(agent)
+    return {"ok": res.ok, "message": res.message}
+
+
+def discard_draft_comment(agent_id: str, idx: int) -> dict:
+    """Mark one draft comment discarded (never posted)."""
+    agent = REGISTRY.get(agent_id)
+    if agent is None or not agent.drafts:
+        return {"ok": False, "error": "no drafts"}
+    draft = next((d for d in agent.drafts if d["idx"] == idx), None)
+    if draft is None:
+        return {"ok": False, "error": "draft not found"}
+    draft["status"] = "discarded"
+    REGISTRY.set_drafts(agent, agent.drafts)
+    _settle_draft_agent(agent)
+    return {"ok": True, "message": "discarded"}
+
+
+def _settle_draft_agent(agent: Agent) -> None:
+    """Mark the draft agent done once every draft is posted or discarded."""
+    if agent.drafts and all(d["status"] != "pending" for d in agent.drafts):
+        REGISTRY.set_status(agent, "done")
+    else:
+        REGISTRY.set_drafts(agent, agent.drafts)  # broadcast updated statuses
+
+
 def rerun_with_hint(agent_id: str, hint: str) -> dict:
     """Resume a needs_input agent's session with a correcting hint and run again.
 
@@ -470,6 +596,12 @@ DASHBOARD_HTML = """<!doctype html>
   .hint textarea { width:100%; min-height:54px; resize:vertical; background:#0f1115; color:#e6e6e6; border:1px solid var(--line); border-radius:7px; padding:8px; font:13px system-ui; }
   .hint button { margin-top:8px; }
   button.rerun { background:#3a2a52; color:#e9d5ff; } button.rerun:hover{ background:#4a356a;}
+  .draft { padding:10px 14px; border-bottom:1px solid var(--line); }
+  .draft .dh { font-size:11px; color:var(--muted); margin-bottom:5px; }
+  .draft .dstatus { text-transform:uppercase; letter-spacing:.04em; }
+  .draft.st-posted { opacity:.6; } .draft.st-posted .dstatus{ color:#5fe39a;}
+  .draft.st-discarded { opacity:.45; } .draft.st-discarded .dstatus{ color:#e38f8f;}
+  .draft pre { margin:0; padding:8px 10px; background:#0c0e12; border-radius:6px; white-space:pre-wrap; word-break:break-word; font-size:12px; }
 </style></head>
 <body>
 <header><h1>Morning Digest · Agents</h1><small id="status">connecting…</small></header>
@@ -565,6 +697,22 @@ function renderArt(){
     }
     html += `</div>`;
   }
+  if(a.drafts && a.drafts.length){
+    html += `<div class="sec"><h3>Draft PR comments — approve each to post</h3>`;
+    a.drafts.forEach(d=>{
+      const prtxt = d.pr ? `PR #${d.pr}` : '(no PR number)';
+      html += `<div class="draft st-${d.status}">
+        <div class="dh">${prtxt} · <span class="dstatus">${d.status}</span></div>
+        <pre>${esc(d.body)}</pre>`;
+      if(d.status==='pending'){
+        html += `<div class="gate-acts" style="position:static;padding:8px 0 4px;background:none;border:0;">
+          <button class="ok" data-post="${a.id}" data-idx="${d.idx}" ${d.pr?'':'disabled'}>✅ Post to PR</button>
+          <button class="no" data-dropc="${a.id}" data-idx="${d.idx}">🗑️ Discard</button></div>`;
+      }
+      html += `</div>`;
+    });
+    html += `</div>`;
+  }
   if(a.final_output){
     html += `<div class="sec"><h3>Output / Draft</h3><pre>${esc(a.final_output)}</pre></div>`;
   }
@@ -593,8 +741,14 @@ document.body.addEventListener('click', ev=>{
     const hint=(box&&box.value||'').trim();
     if(!hint){ alert('Type a hint first'); return; }
     rr.disabled=true; rr.textContent='re-running…';
-    post('/rerun',{id:rr.dataset.rerun, hint});
+    post('/rerun',{id:rr.dataset.rerun, hint}); return;
   }
+  const pc = ev.target.closest('[data-post]');
+  if(pc){ pc.disabled=true; pc.textContent='posting…';
+    post('/post-comment',{id:pc.dataset.post, idx:Number(pc.dataset.idx)}); return; }
+  const dc = ev.target.closest('[data-dropc]');
+  if(dc){ dc.disabled=true;
+    post('/discard-comment',{id:dc.dataset.dropc, idx:Number(dc.dataset.idx)}); }
 });
 function post(path,body){
   fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
@@ -683,6 +837,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200 if res.get("ok") else 400, json.dumps(res).encode())
         elif self.path == "/rerun":
             res = rerun_with_hint(data.get("id", ""), data.get("hint", ""))
+            self._send(200 if res.get("ok") else 400, json.dumps(res).encode())
+        elif self.path == "/post-comment":
+            res = post_draft_comment(data.get("id", ""), int(data.get("idx", -1)))
+            self._send(200 if res.get("ok") else 400, json.dumps(res).encode())
+        elif self.path == "/discard-comment":
+            res = discard_draft_comment(data.get("id", ""), int(data.get("idx", -1)))
             self._send(200 if res.get("ok") else 400, json.dumps(res).encode())
         else:
             self._send(404, b'{"error":"not found"}')
