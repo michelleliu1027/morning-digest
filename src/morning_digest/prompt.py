@@ -109,6 +109,12 @@ draft, an analysis to run) — skip vague or blocked items. Each task object:
   - "cwd": absolute repo path the agent should run in (use ~ for home)
   - "gate": one of "code" (edits files), "draft" (drafts a reply/review for \
 approval), "readonly" (analysis only)
+  - "source": ONE short phrase saying where this task came from — the specific \
+trigger you saw, not a guess. E.g. "CodeRabbit review on PR #1098", \
+"Kristin's DM, 6/13", "#marketing thread from Hana", "Notion task 'Q3 CAC mart'". \
+This is shown to the user so they trust why the task is here. Be specific.
+  - "source_url": a link to that source if you have one (the PR URL, Slack \
+permalink, or Notion page URL), else "".
 
 Output the JSON array and nothing after it. If there are no good tasks, output \
 `<<<TASKS>>>` followed by `[]`.
@@ -116,11 +122,14 @@ Output the JSON array and nothing after it. If there are no good tasks, output \
 
 
 def build_prompt(mode: str, today: str, window: str, slack_messages: str,
-                 with_actions: bool = False) -> str:
+                 with_actions: bool = False, already_handled: str = "") -> str:
     """Assemble the full prompt for the given mode ('daily' or 'weekly').
 
     When ``with_actions`` is set, the digest is followed by a `<<<TASKS>>>`
     JSON block the interactive listener turns into ✅/⏭️ buttons.
+
+    ``already_handled`` is an optional block (from the completion ledger) listing
+    tasks the user already acted on, so the model does not resurface them.
     """
     output = _WEEKLY_OUTPUT if mode == "weekly" else _DAILY_OUTPUT
     # Optional: personalize with the user's name; otherwise stay generic ("your").
@@ -140,6 +149,7 @@ def build_prompt(mode: str, today: str, window: str, slack_messages: str,
         intro
         + _SOURCES
         + slack_block
+        + (already_handled or "")
         + output.format(today=today, window=window)
         + (_ACTIONS_BLOCK if with_actions else "")
     )

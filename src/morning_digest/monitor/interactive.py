@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
+from . import ledger
 from .server import PORT, REGISTRY, serve, spawn_agent
 from .tasks import Task, split_digest_and_tasks
 
@@ -81,6 +82,17 @@ _MSG: dict[str, dict] = {}
 _MSG_LOCK = threading.Lock()
 
 
+def _record_outcome(tid: str, state: str) -> None:
+    """Persist a task's terminal outcome to the completion ledger (best-effort)."""
+    t = _TASKS.get(tid)
+    if not t:
+        return
+    try:
+        ledger.record(state=state, title=t.title, source_url=t.source_url, gate=t.gate)
+    except Exception as exc:  # noqa: BLE001 - ledger is best-effort, never crash a click
+        print(f"[interactive] ledger.record failed: {exc}")
+
+
 def _task_blocks(tasks: list[Task]) -> list[dict]:
     """Build Slack Block Kit blocks: a header + one section+buttons per task."""
     blocks: list[dict] = [
@@ -90,9 +102,12 @@ def _task_blocks(tasks: list[Task]) -> list[dict]:
         {"type": "divider"},
     ]
     for i, t in enumerate(tasks, 1):
+        body = f"*{i}️⃣ {t.title}*\n_{t.gate_label}_"
+        if t.source_label:
+            body += f"\n{t.source_label}"
         blocks.append({
             "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*{i}️⃣ {t.title}*\n_{t.gate_label}_"},
+            "text": {"type": "mrkdwn", "text": body},
         })
         blocks.append({
             "type": "actions",
@@ -100,6 +115,8 @@ def _task_blocks(tasks: list[Task]) -> list[dict]:
             "elements": [
                 {"type": "button", "text": {"type": "plain_text", "text": "✅ Do this"},
                  "style": "primary", "action_id": "do_task", "value": t.id},
+                {"type": "button", "text": {"type": "plain_text", "text": "✔️ Already did it"},
+                 "action_id": "finished_task", "value": t.id},
                 {"type": "button", "text": {"type": "plain_text", "text": "⏭️ Skip"},
                  "action_id": "skip_task", "value": t.id},
             ],
@@ -143,7 +160,17 @@ def build_app() -> App:
     def handle_skip(ack, body, client):
         ack()
         tid = body["actions"][0]["value"]
+        _record_outcome(tid, "skipped")
         _set_task_status(client, body["message"]["ts"], tid, "⏭️ *Skipped*")
+
+    @app.action("finished_task")
+    def handle_finished(ack, body, client):
+        # The user did this themselves before any agent ran. Same suppression
+        # window as a real 'done' — the ledger stops it resurfacing for a week.
+        ack()
+        tid = body["actions"][0]["value"]
+        _record_outcome(tid, "finished")
+        _set_task_status(client, body["message"]["ts"], tid, "✔️ *Already done by you*")
 
     @app.action("do_task")
     def handle_do(ack, body, client):
@@ -158,7 +185,8 @@ def build_app() -> App:
             return
 
         agent = spawn_agent(name=task.title, prompt=task.agent_prompt,
-                            cwd=task.cwd, gate=task.gate)
+                            cwd=task.cwd, gate=task.gate,
+                            source=task.source, source_url=task.source_url)
         _set_task_status(client, thread_ts, tid,
                          f"⏳ *Running…* · <{DASHBOARD_URL}|watch live>")
         client.chat_postMessage(
@@ -232,6 +260,8 @@ def _report_when_done(client, channel: str, thread_ts: str, agent_id: str,
         elapsed = agent.public()["elapsed"]
         if agent.status == "done":
             _set_task_status(client, thread_ts, tid, f"✅ *Done* · {elapsed}s")
+            # Record success so the next digest won't resurface it for a week.
+            _record_outcome(tid, "done")
         else:
             _set_task_status(client, thread_ts, tid, f"❌ *Failed* · {elapsed}s")
 
@@ -291,6 +321,7 @@ def post_live_digest(app: App, mode: str | None = None) -> None:
     prompt = build_prompt(
         mode=win.mode, today=today.isoformat(), window=win.label,
         slack_messages=slack_messages, with_actions=True,
+        already_handled=ledger.format_for_prompt(),
     )
     raw = runner.run_claude(prompt)
     digest_text, tasks = split_digest_and_tasks(raw)
