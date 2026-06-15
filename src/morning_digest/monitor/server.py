@@ -53,7 +53,7 @@ class Agent:
     name: str
     prompt: str
     cwd: str
-    # starting | running | done | failed | awaiting_approval | committing
+    # starting | running | done | failed | awaiting_approval | committing | needs_input
     status: str = "starting"
     gate: str = "readonly"            # readonly | draft | code
     started_at: float = field(default_factory=time.time)
@@ -61,6 +61,10 @@ class Agent:
     events: list[dict] = field(default_factory=list)  # serialized ProgressEvents
     proc: subprocess.Popen | None = None
     diff: dict | None = None          # DiffSnapshot (branch/diff/files/existing_pr) when awaiting approval
+    session_id: str | None = None     # claude session id, for --resume on a re-run
+    note: str = ""                    # why the agent needs human input (shown in dashboard)
+    model: str = "opus"               # model to reuse on a --resume re-run
+    allowed_tools: str = ""           # toolset to reuse on a --resume re-run
 
     def latest(self) -> dict | None:
         return self.events[-1] if self.events else None
@@ -96,6 +100,7 @@ class Agent:
             "final_output": self.final_output(),
             "todos": self.todos(),
             "diff": self.diff,
+            "note": self.note,
         }
 
 
@@ -135,13 +140,18 @@ class Registry:
     def set_status(self, agent: Agent, status: str) -> None:
         with self._lock:
             agent.status = status
-            if status in ("done", "failed"):
+            if status in ("done", "failed", "needs_input"):
                 agent.ended_at = time.time()
         self._broadcast()
 
     def set_diff(self, agent: Agent, diff: dict | None) -> None:
         with self._lock:
             agent.diff = diff
+        self._broadcast()
+
+    def set_note(self, agent: Agent, note: str) -> None:
+        with self._lock:
+            agent.note = note
         self._broadcast()
 
     # --- SSE pub/sub ---
@@ -180,53 +190,85 @@ def spawn_agent(name: str, prompt: str, cwd: str = ".", model: str = "opus",
         allowed_tools = WRITER_ALLOWED_TOOLS if gate == "code" else DEFAULT_ALLOWED_TOOLS
     agent = Agent(id=uuid.uuid4().hex[:8], name=name, prompt=prompt,
                   cwd=str(Path(cwd).expanduser()), gate=gate)
+    agent.allowed_tools = allowed_tools
+    agent.model = model
     REGISTRY.add(agent)
-
-    def run() -> None:
-        cmd = [
-            "claude", "-p", prompt,
-            "--model", model,
-            "--output-format", "stream-json", "--verbose",
-            "--permission-mode", "acceptEdits",
-            "--allowedTools", allowed_tools,
-        ]
-        try:
-            proc = subprocess.Popen(
-                cmd, cwd=agent.cwd, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True, bufsize=1,
-            )
-        except FileNotFoundError:
-            REGISTRY.push_event(agent, ProgressEvent("done", "claude CLI not found on PATH", "❌"))
-            REGISTRY.set_status(agent, "failed")
-            return
-
-        agent.proc = proc
-        REGISTRY.set_status(agent, "running")
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                evt = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            for ev in parse_event(evt):
-                REGISTRY.push_event(agent, ev)
-        rc = proc.wait()
-        if rc != 0:
-            REGISTRY.set_status(agent, "failed")
-            return
-        if agent.gate == "code":
-            _park_for_approval(agent)
-        else:
-            REGISTRY.set_status(agent, "done")
-
-    threading.Thread(target=run, daemon=True).start()
+    threading.Thread(target=_run_agent, args=(agent, prompt), daemon=True).start()
     return agent
 
 
-def _park_for_approval(agent: Agent) -> None:
-    """Capture the uncommitted diff and wait for the user to approve committing."""
+def _run_agent(agent: Agent, prompt: str, resume_session: str | None = None) -> None:
+    """Stream one `claude -p` run into the registry, then decide the terminal state.
+
+    Used for both the first spawn and a `--resume` re-run with a correcting hint.
+    """
+    cmd = [
+        "claude", "-p", prompt,
+        "--model", agent.model,
+        "--output-format", "stream-json", "--verbose",
+        "--permission-mode", "acceptEdits",
+        "--allowedTools", agent.allowed_tools,
+    ]
+    if resume_session:
+        cmd += ["--resume", resume_session]
+    try:
+        proc = subprocess.Popen(
+            cmd, cwd=agent.cwd, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, bufsize=1,
+        )
+    except FileNotFoundError:
+        REGISTRY.push_event(agent, ProgressEvent("done", "claude CLI not found on PATH", "❌"))
+        REGISTRY.set_status(agent, "failed")
+        return
+
+    agent.proc = proc
+    REGISTRY.set_status(agent, "running")
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            evt = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        for ev in parse_event(evt):
+            if ev.kind == "start" and ev.meta.get("session_id"):
+                agent.session_id = ev.meta["session_id"]
+            REGISTRY.push_event(agent, ev)
+    rc = proc.wait()
+    if rc != 0:
+        REGISTRY.set_status(agent, "failed")
+        return
+    if agent.gate == "code":
+        _finish_code_agent(agent)
+    else:
+        REGISTRY.set_status(agent, "done")
+
+
+# Phrases that mean the agent stopped to ask / wasn't sure / didn't actually do the
+# work. A code agent that ends like this must NOT be marked done — it goes to
+# needs_input so the human can correct it and re-run with a hint.
+_UNCERTAINTY_MARKERS = (
+    "let me know", "would you like", "do you want", "should i", "which option",
+    "option 1", "option 2", "options:", "i'm not sure", "i am not sure", "unsure",
+    "please confirm", "could you clarify", "two options", "either way",
+    "your call", "up to you", "i recommend", "waiting for", "before i proceed",
+)
+
+
+def _looks_uncertain(text: str) -> bool:
+    low = text.lower()
+    return any(m in low for m in _UNCERTAINTY_MARKERS)
+
+
+def _finish_code_agent(agent: Agent) -> None:
+    """Decide the terminal state of a finished code agent.
+
+    The dumb failure we are guarding against: the agent makes NO change, declares
+    "work is done", and the run is marked done — when really it picked the wrong
+    branch or wasn't sure. So: no diff OR an uncertain-sounding ending => needs_input
+    (a human checkpoint), never a silent done.
+    """
     try:
         snap = capture_diff(agent.cwd)
     except Exception as exc:  # noqa: BLE001 - surface any git failure to the UI
@@ -234,11 +276,39 @@ def _park_for_approval(agent: Agent) -> None:
         REGISTRY.set_status(agent, "failed")
         return
 
-    if not snap.diff.strip():
-        REGISTRY.push_event(agent, ProgressEvent("done", "no code changes were made", "ℹ️"))
-        REGISTRY.set_status(agent, "done")
+    final = agent.final_output()
+    has_diff = bool(snap.diff.strip())
+
+    if not has_diff:
+        REGISTRY.set_note(
+            agent,
+            "Agent ended WITHOUT making any code change. It may have picked the "
+            "wrong branch or assumed the work was already done. Review its reasoning "
+            "below, then re-run with a hint (e.g. tell it the correct PR branch).")
+        REGISTRY.push_event(agent, ProgressEvent(
+            "done", "⚠️ no change made — needs your input before this counts as done", "✋",
+            full=final or "(no final message)"))
+        REGISTRY.set_status(agent, "needs_input")
         return
 
+    if _looks_uncertain(final):
+        REGISTRY.set_note(
+            agent,
+            "Agent made a change but ended UNSURE (it asked a question or listed "
+            "options). Read its diff and message, then approve, discard, or re-run "
+            "with a hint.")
+        # still capture the diff so she can see what it did do
+        _attach_diff(agent, snap)
+        REGISTRY.push_event(agent, ProgressEvent(
+            "done", "✋ agent is unsure — needs your decision", "✋", full=final))
+        REGISTRY.set_status(agent, "needs_input")
+        return
+
+    _park_for_approval(agent, snap)
+
+
+def _attach_diff(agent: Agent, snap) -> None:
+    """Store a captured diff snapshot on the agent for the dashboard to render."""
     target = (f"existing PR #{snap.existing_pr} (branch `{snap.branch}`)"
               if snap.existing_pr else f"new branch `{snap.branch}` → would open a Draft PR")
     REGISTRY.set_diff(agent, {
@@ -248,6 +318,12 @@ def _park_for_approval(agent: Agent) -> None:
         "existing_pr": snap.existing_pr,
         "target": target,
     })
+
+
+def _park_for_approval(agent: Agent, snap) -> None:
+    """Attach the diff and wait for the user to approve committing."""
+    _attach_diff(agent, snap)
+    target = agent.diff["target"]
     REGISTRY.push_event(agent, ProgressEvent(
         "say", f"✋ change ready for your review → {target}. {len(snap.files)} file(s).",
         "✋", full=f"Target: {target}\nFiles:\n" + "\n".join(snap.files)))
@@ -259,7 +335,7 @@ def approve_commit(agent_id: str, commit_msg: str | None = None) -> dict:
     agent = REGISTRY.get(agent_id)
     if agent is None:
         return {"ok": False, "error": "agent not found"}
-    if agent.status != "awaiting_approval" or not agent.diff:
+    if agent.status not in ("awaiting_approval", "needs_input") or not agent.diff:
         return {"ok": False, "error": f"agent is {agent.status}, nothing to commit"}
 
     REGISTRY.set_status(agent, "committing")
@@ -292,13 +368,44 @@ def reject_diff(agent_id: str) -> dict:
     agent = REGISTRY.get(agent_id)
     if agent is None:
         return {"ok": False, "error": "agent not found"}
-    if agent.status != "awaiting_approval":
+    if agent.status not in ("awaiting_approval", "needs_input"):
         return {"ok": False, "error": f"agent is {agent.status}"}
+    if not agent.diff:
+        REGISTRY.set_status(agent, "done")
+        return {"ok": True, "message": "nothing to discard"}
     res = discard(agent.cwd, label=f"morning-digest:{agent.name}")
     REGISTRY.push_event(agent, ProgressEvent("done", res.message, "🗑️", full=res.message))
     REGISTRY.set_diff(agent, None)
     REGISTRY.set_status(agent, "done")
     return {"ok": res.ok, "message": res.message}
+
+
+def rerun_with_hint(agent_id: str, hint: str) -> dict:
+    """Resume a needs_input agent's session with a correcting hint and run again.
+
+    Headless `claude -p` can't be steered mid-task, so the correction lands as a
+    NEW turn on the same session via `--resume`: the agent keeps all its prior
+    context (what it already looked at) and gets the human's nudge on top.
+    """
+    agent = REGISTRY.get(agent_id)
+    if agent is None:
+        return {"ok": False, "error": "agent not found"}
+    if agent.status != "needs_input":
+        return {"ok": False, "error": f"agent is {agent.status}, not waiting for input"}
+    if not agent.session_id:
+        return {"ok": False, "error": "no session id to resume"}
+    hint = (hint or "").strip()
+    if not hint:
+        return {"ok": False, "error": "empty hint"}
+
+    REGISTRY.set_note(agent, "")
+    REGISTRY.set_diff(agent, None)
+    REGISTRY.push_event(agent, ProgressEvent("say", f"↻ re-run with your hint: {hint}", "↻", full=hint))
+    threading.Thread(
+        target=_run_agent, args=(agent, hint),
+        kwargs={"resume_session": agent.session_id}, daemon=True,
+    ).start()
+    return {"ok": True, "message": "re-running with hint"}
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +434,7 @@ DASHBOARD_HTML = """<!doctype html>
   .running { background:#1d3b2a; color:#5fe39a; } .starting{ background:#3a341d; color:#e3cc5f;}
   .done { background:#1d2a3b; color:#5fa8e3; } .failed{ background:#3b1d1d; color:#e35f5f;}
   .awaiting_approval { background:#3a2a14; color:#f0a85f; } .committing{ background:#2a2a3b; color:#9f9fe3;}
+  .needs_input { background:#3b2a3a; color:#e39ad8; }
   /* center: narration feed */
   .feed-pane { flex:1 1 0; min-width:0; display:flex; flex-direction:column; border-right:1px solid var(--line); }
   .pane-h { padding:10px 14px; border-bottom:1px solid var(--line); font-size:12px; color:var(--muted); display:flex; justify-content:space-between; align-items:center; flex:0 0 auto; }
@@ -357,6 +465,11 @@ DASHBOARD_HTML = """<!doctype html>
   button.stop { background:#4a2a14; color:#ffd9b0; } button:disabled{ opacity:.5; cursor:default; }
   .target { padding:9px 14px; color:#f0a85f; font-size:12px; background:#1a160f; }
   .empty { color:var(--dim); padding:40px; text-align:center; }
+  .note { padding:11px 14px; color:#e39ad8; font-size:12.5px; background:#1f1320; border-left:3px solid #a85fc0; }
+  .hint { padding:12px 14px; background:#1a1320; border-top:1px solid var(--line); }
+  .hint textarea { width:100%; min-height:54px; resize:vertical; background:#0f1115; color:#e6e6e6; border:1px solid var(--line); border-radius:7px; padding:8px; font:13px system-ui; }
+  .hint button { margin-top:8px; }
+  button.rerun { background:#3a2a52; color:#e9d5ff; } button.rerun:hover{ background:#4a356a;}
 </style></head>
 <body>
 <header><h1>Morning Digest · Agents</h1><small id="status">connecting…</small></header>
@@ -422,6 +535,23 @@ function renderArt(){
       return `<li class="${t.status}"><span class="mk">${mk}</span>${esc(t.content||t.activeForm||'')}</li>`;
     }).join('') + `</ul></div>`;
   }
+  if(a.status==='needs_input'){
+    html += `<div class="sec"><h3>✋ Needs your input</h3>`;
+    if(a.note) html += `<div class="note">${esc(a.note)}</div>`;
+    if(a.diff){
+      html += `<div class="target">${esc(a.diff.target)}</div>`;
+      html += `<pre class="diff">${colorDiff(a.diff.diff)}</pre>`;
+    }
+    html += `<div class="hint">
+      <textarea id="hintBox" placeholder="Tell it what to fix, e.g. you're on the wrong branch — first run: gh pr checkout 1098"></textarea>
+      <div class="gate-acts" style="padding:0;background:none;border:0;">
+        <button class="rerun" data-rerun="${a.id}">↻ Re-run with this hint</button>`;
+    if(a.diff){
+      html += `<button class="ok" data-approve="${a.id}">✅ Commit anyway</button>
+               <button class="no" data-reject="${a.id}">🗑️ Discard</button>`;
+    }
+    html += `</div></div></div>`;
+  }
   if(a.diff && (a.status==='awaiting_approval'||a.status==='committing')){
     html += `<div class="sec"><h3>Proposed change (diff)</h3>`;
     html += `<div class="target">✋ ${esc(a.diff.target)}</div>`;
@@ -456,7 +586,15 @@ document.body.addEventListener('click', ev=>{
   const rj = ev.target.closest('[data-reject]');
   if(rj){ rj.disabled=true; post('/reject',{id:rj.dataset.reject}); return; }
   const st = ev.target.closest('[data-stop]');
-  if(st){ st.disabled=true; post('/stop',{id:st.dataset.stop}); }
+  if(st){ st.disabled=true; post('/stop',{id:st.dataset.stop}); return; }
+  const rr = ev.target.closest('[data-rerun]');
+  if(rr){
+    const box=document.getElementById('hintBox');
+    const hint=(box&&box.value||'').trim();
+    if(!hint){ alert('Type a hint first'); return; }
+    rr.disabled=true; rr.textContent='re-running…';
+    post('/rerun',{id:rr.dataset.rerun, hint});
+  }
 });
 function post(path,body){
   fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
@@ -542,6 +680,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200 if res.get("ok") else 400, json.dumps(res).encode())
         elif self.path == "/stop":
             res = stop_agent(data.get("id", ""))
+            self._send(200 if res.get("ok") else 400, json.dumps(res).encode())
+        elif self.path == "/rerun":
+            res = rerun_with_hint(data.get("id", ""), data.get("hint", ""))
             self._send(200 if res.get("ok") else 400, json.dumps(res).encode())
         else:
             self._send(404, b'{"error":"not found"}')

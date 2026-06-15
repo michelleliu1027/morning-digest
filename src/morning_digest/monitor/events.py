@@ -46,7 +46,8 @@ def parse_event(evt: dict) -> list[ProgressEvent]:
                 kind="start",
                 icon="🟢",
                 text=f"session started ({n_tools} tools available)",
-                meta={"model": model, "tools": n_tools},
+                meta={"model": model, "tools": n_tools,
+                      "session_id": evt.get("session_id")},
             )
         ]
 

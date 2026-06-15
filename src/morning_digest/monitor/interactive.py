@@ -137,13 +137,17 @@ def build_app() -> App:
 
 def _report_when_done(client, channel: str, thread_ts: str, agent_id: str, task: Task) -> None:
     # Terminal states differ by gate: a code task first parks in awaiting_approval
-    # (the diff is ready for review) before it can reach done.
+    # (the diff is ready for review) before it can reach done. It may instead land
+    # in needs_input — it didn't actually finish and wants a human correction.
     announced_diff = False
+    announced_input = False
     while True:
         time.sleep(2)
         agent = REGISTRY.get(agent_id)
         if agent is None:
             return
+        if agent.status == "running":  # a re-run restarted it — re-arm the pings
+            announced_diff = announced_input = False
         if agent.status == "awaiting_approval" and not announced_diff:
             announced_diff = True
             target = (agent.diff or {}).get("target", "")
@@ -153,6 +157,15 @@ def _report_when_done(client, channel: str, thread_ts: str, agent_id: str, task:
                      f"dashboard before committing:\n{DASHBOARD_URL}\n_Target: {target}_",
             )
             continue  # keep watching: she'll approve/reject in the dashboard
+        if agent.status == "needs_input" and not announced_input:
+            announced_input = True
+            client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text=f"✋ *{task.title}* — this did NOT finish cleanly: {agent.note}\n"
+                     f"Open the dashboard to read its reasoning and re-run it with a "
+                     f"correcting hint:\n{DASHBOARD_URL}",
+            )
+            continue  # she may re-run with a hint; keep watching for the real outcome
         if agent.status in ("done", "failed"):
             break
 
