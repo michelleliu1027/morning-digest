@@ -32,14 +32,14 @@ HOST = "127.0.0.1"
 PORT = 8787
 
 # Tools a read-only / analysis agent may use without prompting.
-DEFAULT_ALLOWED_TOOLS = "Bash(gh *) Bash(ls *) Bash(find *) mcp__notion__notion-search mcp__notion__notion-fetch"
+DEFAULT_ALLOWED_TOOLS = "TodoWrite Bash(gh *) Bash(ls *) Bash(find *) mcp__notion__notion-search mcp__notion__notion-fetch"
 
 # Tools the code WRITER may use. Deliberately EXCLUDES `git commit` / `git push`:
 # the agent edits files and picks the right branch, but committing only happens
 # after the user approves the diff in the dashboard. The gate is enforced here at
 # the tool level, not merely by the prompt.
 WRITER_ALLOWED_TOOLS = (
-    "Edit Write Read Grep "
+    "TodoWrite Edit Write Read Grep "
     "Bash(git status*) Bash(git diff*) Bash(git log*) Bash(git branch*) "
     "Bash(git checkout*) Bash(git switch*) Bash(git fetch*) Bash(git stash*) "
     "Bash(gh pr list*) Bash(gh pr view*) Bash(gh pr checkout*) "
@@ -72,6 +72,13 @@ class Agent:
                 return ev["full"]
         return ""
 
+    def todos(self) -> list[dict]:
+        """The agent's most recent TodoWrite plan (Manus-style live checklist)."""
+        for ev in reversed(self.events):
+            if ev.get("kind") == "todo":
+                return ev.get("meta", {}).get("todos", [])
+        return []
+
     def public(self) -> dict:
         """JSON-safe snapshot for the dashboard (omits the live Popen handle)."""
         return {
@@ -87,6 +94,7 @@ class Agent:
             "events": self.events,
             "latest": self.latest(),
             "final_output": self.final_output(),
+            "todos": self.todos(),
             "diff": self.diff,
         }
 
@@ -266,6 +274,19 @@ def approve_commit(agent_id: str, commit_msg: str | None = None) -> dict:
     return {"ok": res.ok, "message": res.message, "pr_url": res.pr_url}
 
 
+def stop_agent(agent_id: str) -> dict:
+    """Kill a running agent's process (the one realistic way to interrupt a headless run)."""
+    agent = REGISTRY.get(agent_id)
+    if agent is None:
+        return {"ok": False, "error": "agent not found"}
+    if agent.proc and agent.status in ("running", "starting"):
+        agent.proc.terminate()
+        REGISTRY.push_event(agent, ProgressEvent("done", "stopped by user", "⏹"))
+        REGISTRY.set_status(agent, "failed")
+        return {"ok": True, "message": "stopped"}
+    return {"ok": False, "error": f"agent is {agent.status}, not running"}
+
+
 def reject_diff(agent_id: str) -> dict:
     """User rejected the diff → stash the work (recoverable) and mark done."""
     agent = REGISTRY.get(agent_id)
@@ -288,85 +309,69 @@ DASHBOARD_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Morning Digest · Agents</title>
 <style>
-  :root { color-scheme: light dark; }
-  body { font: 14px/1.5 -apple-system, system-ui, sans-serif; margin: 0; background:#0f1115; color:#e6e6e6; }
-  header { padding: 14px 18px; background:#161922; border-bottom:1px solid #262b36; position:sticky; top:0; }
+  :root { color-scheme: dark; --bg:#0f1115; --panel:#161922; --line:#262b36; --muted:#8b93a7; --dim:#5b6478; }
+  * { box-sizing:border-box; }
+  body { font: 14px/1.5 -apple-system, system-ui, sans-serif; margin:0; background:var(--bg); color:#e6e6e6; height:100vh; display:flex; flex-direction:column; overflow:hidden; }
+  header { padding:12px 18px; background:var(--panel); border-bottom:1px solid var(--line); display:flex; align-items:center; gap:10px; flex:0 0 auto; }
   header h1 { font-size:15px; margin:0; font-weight:600; }
-  header small { color:#8b93a7; }
-  .wrap { display:flex; gap:14px; padding:14px; flex-wrap:wrap; }
-  .card { background:#161922; border:1px solid #262b36; border-radius:10px; width:min(420px,100%); overflow:hidden; }
-  .card h2 { font-size:14px; margin:0; padding:10px 12px; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #262b36; }
-  .badge { font-size:11px; padding:2px 8px; border-radius:99px; font-weight:600; }
+  header small { color:var(--muted); }
+  .layout { flex:1; display:flex; min-height:0; }
+  /* left rail: list of agents */
+  .rail { width:230px; flex:0 0 auto; border-right:1px solid var(--line); background:var(--panel); overflow:auto; }
+  .rail .it { padding:10px 12px; border-bottom:1px solid var(--line); cursor:pointer; }
+  .rail .it:hover { background:#1c2129; }
+  .rail .it.sel { background:#1b2030; border-left:3px solid #5fa8e3; }
+  .rail .it .nm { font-size:13px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .rail .it .sub { font-size:11px; color:var(--muted); margin-top:2px; display:flex; justify-content:space-between; }
+  .badge { font-size:10px; padding:1px 7px; border-radius:99px; font-weight:600; }
   .running { background:#1d3b2a; color:#5fe39a; } .starting{ background:#3a341d; color:#e3cc5f;}
   .done { background:#1d2a3b; color:#5fa8e3; } .failed{ background:#3b1d1d; color:#e35f5f;}
   .awaiting_approval { background:#3a2a14; color:#f0a85f; } .committing{ background:#2a2a3b; color:#9f9fe3;}
-  .prompt { padding:8px 12px; color:#8b93a7; font-size:12px; border-bottom:1px solid #262b36; }
-  .feed { max-height:340px; overflow:auto; padding:6px 0; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
-  .row { padding:3px 12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  /* center: narration feed */
+  .feed-pane { flex:1 1 0; min-width:0; display:flex; flex-direction:column; border-right:1px solid var(--line); }
+  .pane-h { padding:10px 14px; border-bottom:1px solid var(--line); font-size:12px; color:var(--muted); display:flex; justify-content:space-between; align-items:center; flex:0 0 auto; }
+  .feed { flex:1; overflow:auto; padding:6px 0; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
+  .row { padding:3px 14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .row.has-full { cursor:pointer; }
   .row.has-full:hover { background:#1c2129; }
-  .row.open { white-space:pre-wrap; word-break:break-word; background:#0c0e12; border-left:2px solid #3a6; padding:8px 12px; }
-  .row .t { color:#5b6478; margin-right:8px; }
-  .row .caret { color:#5b6478; margin-right:4px; font-size:10px; }
-  .row.tool { color:#9fd0ff; } .row.say{ color:#e6e6e6;} .row.result{ color:#8b93a7;} .row.done{ color:#5fe39a; font-weight:600;}
-  .output { border-top:1px solid #262b36; }
-  .output h3 { font-size:12px; margin:0; padding:8px 12px; color:#5fe39a; display:flex; justify-content:space-between; cursor:pointer; }
-  .output pre { margin:0; padding:0 12px 12px; white-space:pre-wrap; word-break:break-word; font-size:12px; color:#d7dbe3; max-height:420px; overflow:auto; }
-  .empty { color:#5b6478; padding:30px; text-align:center; }
-  .gate { border-top:1px solid #262b36; background:#1a160f; }
-  .gate .target { padding:8px 12px; color:#f0a85f; font-size:12px; }
-  .gate pre.diff { margin:0; padding:0 12px 10px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11.5px; line-height:1.45; white-space:pre; overflow:auto; max-height:460px; }
-  .gate pre.diff .add { color:#5fe39a; } .gate pre.diff .del{ color:#e38f8f;} .gate pre.diff .hdr{ color:#9fd0ff;} .gate pre.diff .at{ color:#c08fe3;}
-  .gate .acts { display:flex; gap:8px; padding:10px 12px; border-top:1px solid #262b36; }
-  .gate button { font:13px system-ui; padding:7px 14px; border-radius:7px; border:0; cursor:pointer; font-weight:600; }
-  .gate button.ok { background:#1d6b3a; color:#cfffe0; } .gate button.ok:hover{ background:#23824a;}
-  .gate button.no { background:#3b1d1d; color:#ffd5d5; } .gate button.no:hover{ background:#5a2a2a;}
-  .gate button:disabled { opacity:.5; cursor:default; }
+  .row.open { white-space:pre-wrap; word-break:break-word; background:#0c0e12; border-left:2px solid #3a6; padding:8px 14px; }
+  .row .t { color:var(--dim); margin-right:8px; }
+  .row .caret { color:var(--dim); margin-right:4px; font-size:10px; }
+  .row.tool { color:#9fd0ff; } .row.say{ color:#e6e6e6;} .row.result{ color:var(--muted);} .row.done{ color:#5fe39a; font-weight:600;} .row.todo{ color:#c9a8ff;}
+  /* right: artifact pane (todo + diff/draft/output) */
+  .art { width:46%; max-width:680px; flex:0 0 auto; overflow:auto; background:#12141a; }
+  .art .sec { border-bottom:1px solid var(--line); }
+  .art .sec h3 { font-size:11px; text-transform:uppercase; letter-spacing:.06em; margin:0; padding:9px 14px; color:var(--muted); background:#14171f; position:sticky; top:0; }
+  .todo { list-style:none; margin:0; padding:6px 0; }
+  .todo li { padding:4px 14px; font-size:13px; display:flex; gap:8px; align-items:baseline; }
+  .todo li .mk { width:14px; flex:0 0 auto; }
+  .todo li.completed { color:var(--dim); text-decoration:line-through; }
+  .todo li.in_progress { color:#e3cc5f; font-weight:600; }
+  .art pre { margin:0; padding:10px 14px; white-space:pre-wrap; word-break:break-word; font-size:12px; color:#d7dbe3; }
+  .art pre.diff { white-space:pre; overflow:auto; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11.5px; line-height:1.45; }
+  pre.diff .add { color:#5fe39a; } pre.diff .del{ color:#e38f8f;} pre.diff .hdr{ color:#9fd0ff;} pre.diff .at{ color:#c08fe3;}
+  .gate-acts { display:flex; gap:8px; padding:12px 14px; background:#1a160f; position:sticky; bottom:0; border-top:1px solid var(--line); }
+  .gate-acts button { font:13px system-ui; padding:8px 16px; border-radius:7px; border:0; cursor:pointer; font-weight:600; }
+  button.ok { background:#1d6b3a; color:#cfffe0; } button.ok:hover{ background:#23824a;}
+  button.no { background:#3b1d1d; color:#ffd5d5; } button.no:hover{ background:#5a2a2a;}
+  button.stop { background:#4a2a14; color:#ffd9b0; } button:disabled{ opacity:.5; cursor:default; }
+  .target { padding:9px 14px; color:#f0a85f; font-size:12px; background:#1a160f; }
+  .empty { color:var(--dim); padding:40px; text-align:center; }
 </style></head>
 <body>
-<header><h1>Morning Digest · Agents <small id="status">connecting…</small></h1></header>
-<div class="wrap" id="wrap"><div class="empty">No agents yet. Spawn one to watch it work here.</div></div>
+<header><h1>Morning Digest · Agents</h1><small id="status">connecting…</small></header>
+<div class="layout">
+  <div class="rail" id="rail"></div>
+  <div class="feed-pane">
+    <div class="pane-h"><span id="feedTitle">No agent selected</span><span id="feedMeta"></span></div>
+    <div class="feed" id="feed"><div class="empty">No agents yet. Trigger one from Slack to watch it work here.</div></div>
+  </div>
+  <div class="art" id="art"></div>
+</div>
 <script>
-const wrap = document.getElementById('wrap');
-const statusEl = document.getElementById('status');
-const openRows = new Set();   // remember which rows the user expanded (by agent+index)
-const openOut = new Set();     // remember which output panels are open
-function render(agents){
-  if(!agents.length){ wrap.innerHTML='<div class="empty">No agents yet. Spawn one to watch it work here.</div>'; return; }
-  wrap.innerHTML = agents.map(a => {
-    const rows = a.events.map((e,i)=>{
-      const key = a.id+':'+i;
-      const hasFull = e.full && e.full.length > (e.text||'').length;
-      const open = openRows.has(key);
-      const cls = `row ${e.kind}${hasFull?' has-full':''}${open?' open':''}`;
-      const body = open ? esc(e.full) : esc(e.text);
-      const caret = hasFull ? `<span class="caret">${open?'▼':'▶'}</span>` : '';
-      return `<div class="${cls}" data-key="${key}"><span class="t">${e.t}s</span>${caret}${e.icon||''} ${body}</div>`;
-    }).join('') || '<div class="row">…</div>';
-    let out = '';
-    if(a.final_output){
-      const oOpen = openOut.has(a.id) || a.status!=='running';
-      out = `<div class="output"><h3 data-out="${a.id}">📄 Output / Draft (click to expand)<span>${oOpen?'▼':'▶'}</span></h3>${oOpen?`<pre>${esc(a.final_output)}</pre>`:''}</div>`;
-    }
-    let gate = '';
-    if(a.diff && a.status==='awaiting_approval'){
-      gate = `<div class="gate">
-        <div class="target">✋ Awaiting your approval → ${esc(a.diff.target)}</div>
-        <pre class="diff">${colorDiff(a.diff.diff)}</pre>
-        <div class="acts">
-          <button class="ok" data-approve="${a.id}">✅ Commit this change</button>
-          <button class="no" data-reject="${a.id}">🗑️ Discard</button>
-        </div></div>`;
-    } else if(a.status==='committing'){
-      gate = `<div class="gate"><div class="target">⏳ committing…</div></div>`;
-    }
-    return `<div class="card">
-      <h2>${esc(a.name)} <span class="badge ${a.status}">${a.status} · ${a.elapsed}s</span></h2>
-      <div class="prompt">${esc(a.prompt)}</div>
-      <div class="feed">${rows}</div>${out}${gate}
-    </div>`;
-  }).join('');
-}
+const openRows = new Set();
+let LAST = [], SEL = null;
+
 function esc(s){ return (s||'').replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 function colorDiff(d){
   return esc(d).split('\\n').map(l=>{
@@ -377,26 +382,92 @@ function colorDiff(d){
     return l;
   }).join('\\n');
 }
-wrap.addEventListener('click', ev => {
+function cur(){ return LAST.find(a=>a.id===SEL) || LAST[0] || null; }
+
+function renderRail(){
+  document.getElementById('rail').innerHTML = LAST.map(a=>{
+    const sel = a.id===(cur()||{}).id ? ' sel':'';
+    const td = a.todos||[]; const done = td.filter(t=>t.status==='completed').length;
+    const plan = td.length ? `${done}/${td.length} steps` : '';
+    return `<div class="it${sel}" data-pick="${a.id}">
+      <div class="nm">${esc(a.name)}</div>
+      <div class="sub"><span class="badge ${a.status}">${a.status}</span><span>${plan||a.elapsed+'s'}</span></div>
+    </div>`;
+  }).join('') || '<div class="empty" style="padding:20px">No agents</div>';
+}
+
+function renderFeed(){
+  const a = cur();
+  const ft = document.getElementById('feedTitle'), fm = document.getElementById('feedMeta'), feed = document.getElementById('feed');
+  if(!a){ ft.textContent='No agent selected'; fm.textContent=''; feed.innerHTML='<div class="empty">No agents yet. Trigger one from Slack to watch it work here.</div>'; return; }
+  ft.textContent = a.name; fm.innerHTML = `<span class="badge ${a.status}">${a.status}</span> · ${a.elapsed}s`;
+  feed.innerHTML = a.events.filter(e=>e.kind!=='todo').map((e,i)=>{
+    const key=a.id+':'+i;
+    const hasFull = e.full && e.full.length>(e.text||'').length;
+    const open = openRows.has(key);
+    const body = open ? esc(e.full) : esc(e.text);
+    const caret = hasFull ? `<span class="caret">${open?'▼':'▶'}</span>`:'';
+    return `<div class="row ${e.kind}${hasFull?' has-full':''}${open?' open':''}" data-key="${key}"><span class="t">${e.t}s</span>${caret}${e.icon||''} ${body}</div>`;
+  }).join('') || '<div class="row">…</div>';
+}
+
+function renderArt(){
+  const a = cur(); const art = document.getElementById('art');
+  if(!a){ art.innerHTML=''; return; }
+  let html = '';
+  const td = a.todos||[];
+  if(td.length){
+    html += `<div class="sec"><h3>Plan</h3><ul class="todo">` + td.map(t=>{
+      const mk = t.status==='completed'?'✓':(t.status==='in_progress'?'▸':'○');
+      return `<li class="${t.status}"><span class="mk">${mk}</span>${esc(t.content||t.activeForm||'')}</li>`;
+    }).join('') + `</ul></div>`;
+  }
+  if(a.diff && (a.status==='awaiting_approval'||a.status==='committing')){
+    html += `<div class="sec"><h3>Proposed change (diff)</h3>`;
+    html += `<div class="target">✋ ${esc(a.diff.target)}</div>`;
+    html += `<pre class="diff">${colorDiff(a.diff.diff)}</pre>`;
+    if(a.status==='awaiting_approval'){
+      html += `<div class="gate-acts">
+        <button class="ok" data-approve="${a.id}">✅ Commit this change</button>
+        <button class="no" data-reject="${a.id}">🗑️ Discard</button></div>`;
+    } else {
+      html += `<div class="gate-acts"><span style="color:var(--muted)">⏳ committing…</span></div>`;
+    }
+    html += `</div>`;
+  }
+  if(a.final_output){
+    html += `<div class="sec"><h3>Output / Draft</h3><pre>${esc(a.final_output)}</pre></div>`;
+  }
+  if(a.status==='running'){
+    html += `<div class="gate-acts"><button class="stop" data-stop="${a.id}">⏹ Stop agent</button></div>`;
+  }
+  art.innerHTML = html || '<div class="empty" style="padding:30px">Nothing to show yet.</div>';
+}
+
+function render(agents){ LAST=agents; if(!SEL && agents.length) SEL=agents[0].id; renderRail(); renderFeed(); renderArt(); }
+
+document.body.addEventListener('click', ev=>{
+  const pick = ev.target.closest('[data-pick]');
+  if(pick){ SEL=pick.dataset.pick; renderRail(); renderFeed(); renderArt(); return; }
   const row = ev.target.closest('.row.has-full');
-  if(row){ const k=row.dataset.key; openRows.has(k)?openRows.delete(k):openRows.add(k); render(LAST); return; }
-  const out = ev.target.closest('[data-out]');
-  if(out){ const id=out.dataset.out; openOut.has(id)?openOut.delete(id):openOut.add(id); render(LAST); return; }
+  if(row){ const k=row.dataset.key; openRows.has(k)?openRows.delete(k):openRows.add(k); renderFeed(); return; }
   const ap = ev.target.closest('[data-approve]');
-  if(ap){ ap.disabled=true; ap.textContent='committing…'; post('/approve', {id:ap.dataset.approve}); return; }
+  if(ap){ ap.disabled=true; ap.textContent='committing…'; post('/approve',{id:ap.dataset.approve}); return; }
   const rj = ev.target.closest('[data-reject]');
-  if(rj){ rj.disabled=true; post('/reject', {id:rj.dataset.reject}); }
+  if(rj){ rj.disabled=true; post('/reject',{id:rj.dataset.reject}); return; }
+  const st = ev.target.closest('[data-stop]');
+  if(st){ st.disabled=true; post('/stop',{id:st.dataset.stop}); }
 });
-function post(path, body){
-  fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)})
+function post(path,body){
+  fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
     .then(r=>r.json()).then(res=>{ if(!res.ok) alert(res.error||res.message||'failed'); });
 }
-let LAST = [];
-const es = new EventSource('/events');
-es.onopen = ()=> statusEl.textContent='live';
-es.onerror = ()=> statusEl.textContent='reconnecting…';
-es.onmessage = e => { LAST = JSON.parse(e.data); render(LAST); };
-fetch('/agents').then(r=>r.json()).then(d=>{ LAST=d; render(d); });
+const statusEl=document.getElementById('status');
+const es=new EventSource('/events');
+es.onopen=()=>statusEl.textContent='live';
+es.onerror=()=>statusEl.textContent='reconnecting…';
+es.onmessage=e=>render(JSON.parse(e.data));
+fetch('/agents').then(r=>r.json()).then(render);
 </script>
 </body></html>"""
 
@@ -468,6 +539,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200 if res.get("ok") else 400, json.dumps(res).encode())
         elif self.path == "/reject":
             res = reject_diff(data.get("id", ""))
+            self._send(200 if res.get("ok") else 400, json.dumps(res).encode())
+        elif self.path == "/stop":
+            res = stop_agent(data.get("id", ""))
             self._send(200 if res.get("ok") else 400, json.dumps(res).encode())
         else:
             self._send(404, b'{"error":"not found"}')

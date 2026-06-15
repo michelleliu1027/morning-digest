@@ -59,7 +59,20 @@ def parse_event(evt: dict) -> list[ProgressEvent]:
                 out.append(ProgressEvent(kind="say", icon="💬", text=_short(txt), full=txt))
             elif bt == "tool_use":
                 name = block.get("name", "?")
-                detail = _tool_detail(block.get("input", {}))
+                inp = block.get("input", {})
+                if name == "TodoWrite":
+                    todos = inp.get("todos", [])
+                    done = sum(1 for t in todos if t.get("status") == "completed")
+                    out.append(
+                        ProgressEvent(
+                            kind="todo",
+                            icon="✓",
+                            text=f"plan: {done}/{len(todos)} done",
+                            meta={"todos": todos},
+                        )
+                    )
+                    continue
+                detail = _tool_detail(inp)
                 out.append(
                     ProgressEvent(
                         kind="tool",
