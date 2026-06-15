@@ -34,16 +34,16 @@ TASKS_MARKER = "<<<TASKS>>>"
 # in the task prompt itself, makes consulting the personal knowledge base a hard
 # step — the same pattern the code/draft preambles use to force a tool action.
 BRAIN_PREAMBLE = (
-    "BEFORE you start, consult the user's personal knowledge base (the "
-    "\"claude-brain\" Obsidian vault at ~/claude-brain) — it is the source of "
-    "truth for her prior investigations, data models, dashboards, and SOPs "
-    "(especially marketing attribution, AppsFlyer, ad-spend pipelines, dbt):\n"
-    "  1. `grep` ~/claude-brain/INDEX.md for keywords from this task.\n"
-    "  2. Read each matching note under ~/claude-brain/notes/ or ~/claude-brain/refs/.\n"
+    "BEFORE you start, consult the user's personal knowledge base if one is "
+    "configured (e.g. a local Obsidian vault at ~/claude-brain) — it is the "
+    "source of truth for their prior investigations, data models, and SOPs:\n"
+    "  1. `grep` the vault's INDEX.md for keywords from this task.\n"
+    "  2. Read each matching note under the vault's notes/ or refs/ folders.\n"
     "  3. Follow its [[wikilinks]] to related notes for fuller context.\n"
-    "If a search turns up nothing relevant, say so briefly and proceed — but you "
-    "must actually look first rather than assume. This vault is private and "
-    "local-only: never copy its contents into a PR, commit, or any shared place.\n\n"
+    "If no vault is configured or a search turns up nothing relevant, say so "
+    "briefly and proceed — but you must actually look first rather than assume. "
+    "Such a vault is private and local-only: never copy its contents into a PR, "
+    "commit, or any shared place.\n\n"
 )
 
 # Prepended to every "code" task. Tells the writer to pick the right branch and
@@ -54,7 +54,7 @@ CODE_PREAMBLE = (
     "committed. Do NOT commit, push, or open a PR — you do not have those tools, and "
     "committing happens only after the human approves your diff.\n\n"
     "STEP 1 — get on the RIGHT branch (do not assume the current branch is correct):\n"
-    "  - If the task names a specific PR (e.g. \"#1098\"), you MUST run "
+    "  - If the task names a specific PR (e.g. \"#123\"), you MUST run "
     "`gh pr checkout <n>` to switch to that PR's real branch FIRST. Branch names can "
     "look similar but differ — never guess the branch from its name; let "
     "`gh pr checkout` resolve it. After checkout, run `git branch --show-current` and "
@@ -84,17 +84,17 @@ CODE_PREAMBLE = (
     "a JSON array that maps each distinct issue you handled to the files you changed "
     "for it. This is what links a reviewer comment to its diff in the dashboard, so "
     "be precise. Each object:\n"
-    "  - \"title\": the issue in <=8 words (e.g. \"join_key NULL collapse\")\n"
+    "  - \"title\": the issue in <=8 words (e.g. \"null key collapses rows\")\n"
     "  - \"severity\": \"High\" | \"Medium\" | \"Low\" | \"\" (copy the reviewer's label if any)\n"
-    "  - \"did\": one short line on the fix you made (e.g. \"coalesce campaign_name fallback\")\n"
+    "  - \"did\": one short line on the fix you made (e.g. \"added a non-null fallback\")\n"
     "  - \"files\": array of the exact repo-relative paths you edited for THIS issue "
     "(must match the diff's paths). If you addressed an issue WITHOUT editing (already "
     "fixed, or you skipped it), use an empty array and explain in \"did\".\n"
     "Output one object per distinct reviewer issue. If there was no external feedback "
     "(plain task), output a single object describing the task. Example:\n"
-    "  [{\"title\":\"join_key NULL collapse\",\"severity\":\"High\","
-    "\"did\":\"added coalesce(campaign_name, media_source||'__unknown') fallback\","
-    "\"files\":[\"analytics/models/.../campaign_cac_daily.sql\"]}]\n\n"
+    "  [{\"title\":\"null key collapses rows\",\"severity\":\"High\","
+    "\"did\":\"added a non-null fallback for the join key\","
+    "\"files\":[\"path/to/model.sql\"]}]\n\n"
     "Then continue with your normal summary.\n\n"
     "End with a short summary of what you changed and which branch/PR it targets.\n\n"
     "--- TASK ---\n"
@@ -125,7 +125,7 @@ class Task:
     prompt: str      # what the agent is told to do
     cwd: str = "."   # repo/dir to run in
     gate: str = "readonly"  # "code" | "draft" | "readonly"
-    source: str = ""        # one-line provenance ("CodeRabbit review on PR #1098")
+    source: str = ""        # one-line provenance ("CodeRabbit review on PR #123")
     source_url: str = ""    # link to that source, if any
 
     @property

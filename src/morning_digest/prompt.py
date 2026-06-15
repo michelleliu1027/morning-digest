@@ -104,14 +104,14 @@ of the 1-5 most worthwhile tasks the user could hand to an agent right now. \
 Pick only things that are concretely actionable today (a PR to fix, a reply to \
 draft, an analysis to run) — skip vague or blocked items. Each task object:
 
-  - "title": short label (<=60 chars), e.g. "Add schema test to dagster-etl#1098"
+  - "title": short label (<=60 chars), e.g. "Add a schema test to PR #123"
   - "prompt": clear instruction the agent will execute
   - "cwd": absolute repo path the agent should run in (use ~ for home)
   - "gate": one of "code" (edits files), "draft" (drafts a reply/review for \
 approval), "readonly" (analysis only)
   - "source": ONE short phrase saying where this task came from — the specific \
-trigger you saw, not a guess. E.g. "CodeRabbit review on PR #1098", \
-"Kristin's DM, 6/13", "#marketing thread from Hana", "Notion task 'Q3 CAC mart'". \
+trigger you saw, not a guess. E.g. "CodeRabbit review on PR #123", \
+"a teammate's DM, 6/13", "#team-channel thread", "Notion task 'Q3 plan'". \
 This is shown to the user so they trust why the task is here. Be specific.
   - "source_url": a link to that source if you have one (the PR URL, Slack \
 permalink, or Notion page URL), else "".

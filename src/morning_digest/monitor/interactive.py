@@ -45,31 +45,33 @@ DIGEST_HOUR = int(os.environ.get("DIGEST_HOUR", "8"))
 _STATE_DIR = Path(__file__).resolve().parents[3] / "digest_output"
 _LAST_SENT_FILE = _STATE_DIR / ".last_digest_date"
 
-# Demo task set. Later these are generated from the digest; the shape is what matters.
+# Demo task set used by `--demo`. These are placeholders to show the shape of a
+# task; in real use tasks are generated from your digest. Edit them to point at
+# your own repos/PRs, or just run a live digest instead.
 DEMO_TASKS = [
     Task(
-        id="cac-schema",
-        title="Add schema test to dagster-etl#1098",
-        prompt="Add a campaign_cac_daily.yml schema file with a grain uniqueness "
-               "test to satisfy Bugbot. This extends PR #1098 — add it to that PR's "
-               "branch as a new commit rather than opening a separate PR.",
-        cwd="~/Documents/GitHub/dagster-etl",
+        id="demo-code",
+        title="Add a schema test to PR #123",
+        prompt="Add a schema/uniqueness test to satisfy the failing check. This "
+               "extends PR #123 — add it to that PR's branch as a new commit rather "
+               "than opening a separate PR.",
+        cwd="~/your-repo",
         gate="code",
     ),
     Task(
-        id="review-1095",
-        title="Review dagster-etl#1095 (PL funnel)",
-        prompt="Read the diff of dagster-etl PR #1095 via gh, then draft review "
-               "comments. Output the draft only — do not post it.",
-        cwd="~/Documents/GitHub/dagster-etl",
+        id="demo-draft",
+        title="Review PR #124",
+        prompt="Read the diff of PR #124 via gh, then draft review comments. "
+               "Output the draft only — do not post it.",
+        cwd="~/your-repo",
         gate="draft",
     ),
     Task(
-        id="datalocker",
-        title="Investigate Data Locker status",
-        prompt="Summarize the current state of the Data Locker / AppsFlyer ingestion "
-               "work by reading the relevant code and Notion notes. Read-only.",
-        cwd="~/Documents/GitHub/data-monorepo",
+        id="demo-readonly",
+        title="Investigate the status of feature X",
+        prompt="Summarize the current state of feature X by reading the relevant "
+               "code and notes. Read-only.",
+        cwd="~/your-repo",
         gate="readonly",
     ),
 ]

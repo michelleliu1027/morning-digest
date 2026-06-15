@@ -90,7 +90,7 @@ class Agent:
     allowed_tools: str = ""           # toolset to reuse on a --resume re-run
     drafts: list[dict] | None = None  # draft PR comments awaiting per-item approval
     pr_feedback: str = ""             # all PR review comments fetched server-side
-    source: str = ""                  # task provenance from the digest ("CodeRabbit on #1098")
+    source: str = ""                  # task provenance from the digest ("CodeRabbit on #123")
     source_url: str = ""              # link to that source, if any
 
     def latest(self) -> dict | None:
@@ -224,7 +224,7 @@ def _fetch_pr_feedback(prompt: str, cwd: str) -> str:
     found — never raises (a gh hiccup must not block a spawn).
 
     Searches only the BARE task text, not the prepended preambles — CODE_PREAMBLE
-    contains a literal "#1098" example that would otherwise match for every task.
+    contains a literal "#123" example that would otherwise match for every task.
     """
     m = _PR_NUM_RE.search(_bare_task(prompt))
     if not m:
