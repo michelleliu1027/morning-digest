@@ -9,6 +9,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Interactive mode: ✅/⏭️ buttons in Slack that spawn local agents (Socket Mode).
+# Not needed for the plain send-only digest.
+interactive = [
+    "slack-bolt>=1.18.0",
+]
 dev = [
     "ruff>=0.1.0",
 ]
