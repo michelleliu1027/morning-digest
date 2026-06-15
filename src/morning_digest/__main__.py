@@ -31,12 +31,19 @@ def build_digest(mode: str | None = None) -> str:
     model = os.environ.get("CLAUDE_MODEL", "opus")
 
     today = date.today()
-    win = compute_window(today)
-    if mode:
-        win.mode = mode  # allow forcing daily/weekly
+    win = compute_window(today, force_mode=mode)
 
     user_id = os.environ.get("MY_SLACK_USER_ID", "")
-    slack_messages = fetch_messages(user_id, after=win.after, before=win.before) if user_id else ""
+    slack_messages = (
+        fetch_messages(
+            user_id,
+            after=win.after,
+            before=win.before,
+            include_sent=(win.mode == "weekly"),
+        )
+        if user_id
+        else ""
+    )
 
     prompt = build_prompt(
         mode=win.mode,

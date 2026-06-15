@@ -2,7 +2,7 @@
 
 - Tue–Fri  -> "daily": look back at the previous day.
 - Monday   -> "weekly": look back across the weekend + the prior week, and
-              additionally assess progress (done vs. follow-up) against her PRs.
+              additionally assess progress (done vs. follow-up) against your PRs.
 - Sat/Sun  -> "daily" on the previous day (rarely run, but defined for safety).
 """
 
@@ -18,21 +18,26 @@ class Window:
     label: str         # human description for the digest header
 
 
-def compute_window(today: date | None = None) -> Window:
-    today = today or date.today()
-    weekday = today.weekday()  # Mon=0 ... Sun=6
+def _weekly_window(today: date) -> Window:
+    """The 7 days ending yesterday (covers the weekend + the prior week)."""
+    start = today - timedelta(days=7)
+    # after: is exclusive, so subtract one more day to include `start` itself.
+    after = start - timedelta(days=1)
+    before = today  # up to (but not including) today
+    label = f"{start.isoformat()} → {(today - timedelta(days=1)).isoformat()} (last week)"
+    return Window(mode="weekly", after=after, before=before, label=label)
 
-    if weekday == 0:  # Monday -> cover the prior week incl. weekend
-        # Range we want: last Monday 00:00 through Sunday 23:59 (the full prior week).
-        last_monday = today - timedelta(days=7)
-        # after: is exclusive, so subtract one more day to include last Monday itself.
-        after = last_monday - timedelta(days=1)
-        before = today  # up to (but not including) today
-        label = f"{last_monday.isoformat()} → {(today - timedelta(days=1)).isoformat()} (last week)"
-        return Window(mode="weekly", after=after, before=before, label=label)
 
-    # Otherwise: previous calendar day.
+def _daily_window(today: date) -> Window:
     prev = today - timedelta(days=1)
     after = prev - timedelta(days=1)  # exclusive lower bound
     before = today                     # exclusive upper bound -> just `prev`
     return Window(mode="daily", after=after, before=before, label=prev.isoformat())
+
+
+def compute_window(today: date | None = None, force_mode: str | None = None) -> Window:
+    """Pick the lookback window. Auto-selects weekly on Monday, daily otherwise;
+    pass force_mode='daily'|'weekly' to override (and get the matching window)."""
+    today = today or date.today()
+    mode = force_mode or ("weekly" if today.weekday() == 0 else "daily")
+    return _weekly_window(today) if mode == "weekly" else _daily_window(today)
