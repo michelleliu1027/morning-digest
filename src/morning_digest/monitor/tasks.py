@@ -19,7 +19,14 @@ monitor spawn agents without either knowing the other's internals.
 
 from __future__ import annotations
 
+import json
+import re
+import uuid
 from dataclasses import dataclass
+
+# Marker the digest prompt emits to separate the human-readable digest from the
+# machine-readable task list (see prompt._ACTIONS_BLOCK).
+TASKS_MARKER = "<<<TASKS>>>"
 
 # Prepended to every "code" task. Tells the writer to pick the right branch and
 # STOP before committing — the diff-preview → approve → commit gate lives in the
@@ -71,3 +78,39 @@ class Task:
     def agent_prompt(self) -> str:
         """The prompt actually sent to the agent (code tasks get the placement preamble)."""
         return CODE_PREAMBLE + self.prompt if self.gate == "code" else self.prompt
+
+
+_VALID_GATES = {"code", "draft", "readonly"}
+_JSON_ARRAY_RE = re.compile(r"\[.*\]", re.DOTALL)
+
+
+def split_digest_and_tasks(raw: str) -> tuple[str, list[Task]]:
+    """Split the model output into (human digest text, parsed Task list).
+
+    The digest is everything before TASKS_MARKER; after it is a JSON array of
+    task specs. Malformed/missing JSON yields no tasks (the digest still sends).
+    """
+    if TASKS_MARKER not in raw:
+        return raw.strip(), []
+    digest, _, tail = raw.partition(TASKS_MARKER)
+    m = _JSON_ARRAY_RE.search(tail)
+    if not m:
+        return digest.strip(), []
+    try:
+        specs = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return digest.strip(), []
+
+    tasks: list[Task] = []
+    for spec in specs if isinstance(specs, list) else []:
+        if not isinstance(spec, dict) or not spec.get("title") or not spec.get("prompt"):
+            continue
+        gate = spec.get("gate", "readonly")
+        tasks.append(Task(
+            id=uuid.uuid4().hex[:8],
+            title=str(spec["title"])[:80],
+            prompt=str(spec["prompt"]),
+            cwd=str(spec.get("cwd", ".")),
+            gate=gate if gate in _VALID_GATES else "readonly",
+        ))
+    return digest.strip(), tasks

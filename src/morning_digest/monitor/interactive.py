@@ -26,7 +26,7 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from .server import PORT, REGISTRY, serve, spawn_agent
-from .tasks import Task
+from .tasks import Task, split_digest_and_tasks
 
 load_dotenv()
 
@@ -180,7 +180,7 @@ def _report_when_done(client, channel: str, thread_ts: str, agent_id: str, task:
     }.get(task.gate, "")
     client.chat_postMessage(
         channel=channel, thread_ts=thread_ts,
-        text=f"{head}：*{task.title}* （{agent.public()['elapsed']}s）\n{summary}\n{note}",
+        text=f"{head}: *{task.title}* ({agent.public()['elapsed']}s)\n{summary}\n{note}",
     )
 
 
@@ -196,7 +196,55 @@ def post_tasks(app: App, tasks: list[Task] | None = None) -> None:
     )
 
 
+def post_live_digest(app: App, mode: str | None = None) -> None:
+    """Build the real digest (with actionable tasks), post it, then the buttons.
+
+    This is the bridge from v1 (text digest) to v2 (tappable tasks): one Claude
+    run produces both the human digest and the machine-readable task list.
+    """
+    # Imported lazily so the demo path doesn't require the full digest deps.
+    from datetime import date
+
+    from ..prompt import build_prompt
+    from ..slack_format import to_slack_blocks, to_slack_mrkdwn
+    from ..window import compute_window
+    from .. import __main__ as runner
+
+    today = date.today()
+    win = compute_window(today, force_mode=mode)
+    user_id = os.environ["MY_SLACK_USER_ID"]
+    from ..slack_source import fetch_messages
+    slack_messages = fetch_messages(
+        user_id, after=win.after, before=win.before,
+        include_sent=(win.mode == "weekly"),
+    )
+    prompt = build_prompt(
+        mode=win.mode, today=today.isoformat(), window=win.label,
+        slack_messages=slack_messages, with_actions=True,
+    )
+    raw = runner.run_claude(prompt)
+    digest_text, tasks = split_digest_and_tasks(raw)
+
+    app.client.chat_postMessage(
+        channel=user_id, blocks=to_slack_blocks(digest_text),
+        text=to_slack_mrkdwn(digest_text), unfurl_links=False,
+    )
+    if tasks:
+        post_tasks(app, tasks)
+    else:
+        print("[interactive] digest had no actionable tasks; no buttons posted.")
+
+
 def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Interactive digest + agent buttons.")
+    parser.add_argument("--demo", action="store_true",
+                        help="Post the hardcoded demo tasks instead of a live digest.")
+    parser.add_argument("--mode", choices=["daily", "weekly"], default=None,
+                        help="Force digest mode (default: auto by weekday).")
+    args = parser.parse_args()
+
     for env in (BOT_TOKEN_ENV, APP_TOKEN_ENV, "MY_SLACK_USER_ID"):
         if not os.environ.get(env):
             raise SystemExit(f"Missing {env} in .env")
@@ -206,8 +254,11 @@ def main() -> None:
     time.sleep(0.5)
 
     app = build_app()
-    post_tasks(app)
-    print(f"[interactive] tasks posted to Slack. Dashboard: {DASHBOARD_URL}")
+    if args.demo:
+        post_tasks(app)
+    else:
+        post_live_digest(app, mode=args.mode)
+    print(f"[interactive] posted to Slack. Dashboard: {DASHBOARD_URL}")
     print("[interactive] listening for button clicks (Ctrl-C to stop)…")
     SocketModeHandler(app, os.environ[APP_TOKEN_ENV]).start()
 

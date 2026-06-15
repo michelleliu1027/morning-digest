@@ -92,8 +92,36 @@ bot's own past DMs).
 """
 
 
-def build_prompt(mode: str, today: str, window: str, slack_messages: str) -> str:
-    """Assemble the full prompt for the given mode ('daily' or 'weekly')."""
+# Appended only when the interactive listener wants tappable task buttons. Asks
+# Claude to emit a machine-readable task list after the human digest, so the
+# listener can render ✅/⏭️ buttons that spawn an agent per task.
+_ACTIONS_BLOCK = """\
+
+## Actionable tasks (machine-readable — append AFTER the digest above)
+
+After the digest, output a line containing only `<<<TASKS>>>` then a JSON array \
+of the 1-5 most worthwhile tasks the user could hand to an agent right now. \
+Pick only things that are concretely actionable today (a PR to fix, a reply to \
+draft, an analysis to run) — skip vague or blocked items. Each task object:
+
+  - "title": short label (<=60 chars), e.g. "Add schema test to dagster-etl#1098"
+  - "prompt": clear instruction the agent will execute
+  - "cwd": absolute repo path the agent should run in (use ~ for home)
+  - "gate": one of "code" (edits files), "draft" (drafts a reply/review for \
+approval), "readonly" (analysis only)
+
+Output the JSON array and nothing after it. If there are no good tasks, output \
+`<<<TASKS>>>` followed by `[]`.
+"""
+
+
+def build_prompt(mode: str, today: str, window: str, slack_messages: str,
+                 with_actions: bool = False) -> str:
+    """Assemble the full prompt for the given mode ('daily' or 'weekly').
+
+    When ``with_actions`` is set, the digest is followed by a `<<<TASKS>>>`
+    JSON block the interactive listener turns into ✅/⏭️ buttons.
+    """
     output = _WEEKLY_OUTPUT if mode == "weekly" else _DAILY_OUTPUT
     # Optional: personalize with the user's name; otherwise stay generic ("your").
     name = os.environ.get("MY_NAME", "").strip()
@@ -113,4 +141,5 @@ def build_prompt(mode: str, today: str, window: str, slack_messages: str) -> str
         + _SOURCES
         + slack_block
         + output.format(today=today, window=window)
+        + (_ACTIONS_BLOCK if with_actions else "")
     )

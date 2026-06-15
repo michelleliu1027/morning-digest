@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 from slack_sdk import WebClient
 
 from .prompt import build_prompt
-from .slack_format import to_slack_mrkdwn
+from .slack_format import to_slack_blocks, to_slack_mrkdwn
 from .slack_source import fetch_messages
 from .window import compute_window
 
@@ -25,11 +25,41 @@ load_dotenv()
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def build_digest(mode: str | None = None) -> str:
-    """Invoke the claude CLI headlessly to gather sources and produce the digest."""
+def run_claude(prompt: str) -> str:
+    """Invoke the claude CLI headlessly with the digest toolset; return stdout.
+
+    Runs from the user's home so the Notion MCP (a user-scoped HTTP server) and
+    gh CLI auth resolve exactly as they do in an interactive session.
+    """
     claude_bin = os.environ.get("CLAUDE_BIN", "claude")
     model = os.environ.get("CLAUDE_MODEL", "opus")
+    cmd = [
+        claude_bin,
+        "-p",
+        prompt,
+        "--model",
+        model,
+        "--permission-mode",
+        "acceptEdits",
+        "--allowedTools",
+        "Bash(gh *) mcp__notion__notion-search mcp__notion__notion-fetch",
+    ]
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        cwd=str(Path.home()),
+        timeout=600,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"claude exited {result.returncode}\nstderr:\n{result.stderr}"
+        )
+    return result.stdout.strip()
 
+
+def build_digest(mode: str | None = None) -> str:
+    """Gather sources and produce the digest text (no actionable-task block)."""
     today = date.today()
     win = compute_window(today, force_mode=mode)
 
@@ -51,33 +81,7 @@ def build_digest(mode: str | None = None) -> str:
         window=win.label,
         slack_messages=slack_messages,
     )
-
-    cmd = [
-        claude_bin,
-        "-p",
-        prompt,
-        "--model",
-        model,
-        "--permission-mode",
-        "acceptEdits",
-        "--allowedTools",
-        "Bash(gh *) mcp__notion__notion-search mcp__notion__notion-fetch",
-    ]
-
-    # Run from the user's home so the Notion MCP (a user-scoped HTTP server) and
-    # gh CLI auth resolve exactly as they do in an interactive session.
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        cwd=str(Path.home()),
-        timeout=600,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"claude exited {result.returncode}\nstderr:\n{result.stderr}"
-        )
-    return result.stdout.strip()
+    return run_claude(prompt)
 
 
 def send_to_slack(text: str) -> None:
@@ -90,8 +94,11 @@ def send_to_slack(text: str) -> None:
         )
     client = WebClient(token=token)
     # Posting to a user ID opens (or reuses) the DM with that user.
+    # Blocks give us a real header, dividers, and bullet glyphs; `text` is the
+    # notification/preview fallback for clients that can't render blocks.
     client.chat_postMessage(
         channel=user_id,
+        blocks=to_slack_blocks(text),
         text=to_slack_mrkdwn(text),
         unfurl_links=False,
     )
