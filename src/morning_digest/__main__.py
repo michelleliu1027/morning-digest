@@ -1,7 +1,8 @@
-"""Morning digest: have Claude gather Notion + GitHub, then DM the summary to Slack.
+"""Morning digest: have Claude gather Notion + GitHub + Slack, then DM the summary.
 
-Run: python -m morning_digest          (gather + send to Slack)
-     python -m morning_digest --dry-run (gather + print to terminal, no Slack)
+Run: python -m morning_digest             (auto mode by weekday; send to Slack)
+     python -m morning_digest --dry-run    (gather + print to terminal, no Slack)
+     python -m morning_digest --mode weekly (force the Monday weekly review)
 """
 
 import argparse
@@ -14,23 +15,40 @@ from pathlib import Path
 from dotenv import load_dotenv
 from slack_sdk import WebClient
 
-from .prompt import DIGEST_PROMPT
+from .prompt import build_prompt
 from .slack_format import to_slack_mrkdwn
+from .slack_source import fetch_messages
+from .window import compute_window
 
 load_dotenv()
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def build_digest() -> str:
+def build_digest(mode: str | None = None) -> str:
     """Invoke the claude CLI headlessly to gather sources and produce the digest."""
     claude_bin = os.environ.get("CLAUDE_BIN", "claude")
     model = os.environ.get("CLAUDE_MODEL", "opus")
 
+    today = date.today()
+    win = compute_window(today)
+    if mode:
+        win.mode = mode  # allow forcing daily/weekly
+
+    user_id = os.environ.get("MY_SLACK_USER_ID", "")
+    slack_messages = fetch_messages(user_id, after=win.after, before=win.before) if user_id else ""
+
+    prompt = build_prompt(
+        mode=win.mode,
+        today=today.isoformat(),
+        window=win.label,
+        slack_messages=slack_messages,
+    )
+
     cmd = [
         claude_bin,
         "-p",
-        DIGEST_PROMPT,
+        prompt,
         "--model",
         model,
         "--permission-mode",
@@ -79,10 +97,16 @@ def main() -> None:
         action="store_true",
         help="Print the digest to the terminal instead of sending to Slack.",
     )
+    parser.add_argument(
+        "--mode",
+        choices=["daily", "weekly"],
+        default=None,
+        help="Force a mode. Default: auto (weekly on Monday, daily otherwise).",
+    )
     args = parser.parse_args()
 
     print(f"[morning-digest] building digest for {date.today()}...", file=sys.stderr)
-    digest = build_digest()
+    digest = build_digest(mode=args.mode)
 
     if not digest:
         print("[morning-digest] claude returned nothing; aborting.", file=sys.stderr)
