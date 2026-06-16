@@ -316,9 +316,13 @@ def post_live_digest(app: App, mode: str | None = None) -> None:
     win = compute_window(today, force_mode=mode)
     user_id = os.environ["MY_SLACK_USER_ID"]
     from ..slack_source import fetch_messages
+    # include_sent=True even for the daily digest: the user's own replies
+    # (tagged [ME]) are the evidence the model needs to tell an already-answered
+    # @mention/DM from one that still owes a reply. Without them it can only see
+    # the incoming ask and re-surfaces things the user already handled.
     slack_messages = fetch_messages(
         user_id, after=win.after, before=win.before,
-        include_sent=(win.mode == "weekly"),
+        include_sent=True,
     )
     prompt = build_prompt(
         mode=win.mode, today=today.isoformat(), window=win.label,

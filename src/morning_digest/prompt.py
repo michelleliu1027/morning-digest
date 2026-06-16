@@ -15,11 +15,20 @@ soon. Prefer task databases and their own pages. Skip anything clearly done or a
    - `gh search prs --author=@me --state=open` (their own open PRs — note CI/review status)
    - If GITHUB_REPOS env is set, you may also scope to those repos.
 
-3. **Slack messages** — provided to you below (already fetched). These are \
-@mentions of the user and DMs to them, within the lookback window. Use them to \
-surface things they may have missed or still owe a reply to. IGNORE automated/bot \
-messages (including this digest bot's own past messages) and anything they clearly \
-already handled.
+3. **Slack messages** — provided to you below (already fetched). These include \
+@mentions of the user, DMs to them, AND the user's OWN replies (tagged [ME]), all \
+within the lookback window. Use them to surface things they may have missed or \
+still owe a reply to.
+
+   CRITICAL — judge whether each incoming ask was already resolved BY THE USER: \
+for every @mention/DM, look for a later [ME] message from the user in the SAME \
+channel/thread that answers it. If the user already replied and the reply settles \
+the ask, treat it as HANDLED — do NOT list it under "needs attention". If the user \
+replied but the other person is still waiting (a follow-up question, a promised \
+deliverable not yet sent, an unanswered point), list it as awaiting follow-up and \
+say specifically what is still outstanding. Only list an item as needing a reply \
+if there is NO [ME] response to it at all. IGNORE automated/bot messages (including \
+this digest bot's own past messages).
 """
 
 _DAILY_OUTPUT = """\
@@ -39,7 +48,10 @@ Group items by type. Omit any section that's empty.
 - <one line per item>
 
 *:inbox_tray: From Slack ({window} — things you may have missed)*
-- <one line per @mention/DM that still needs your attention, with who + where + link>
+- <one line per @mention/DM that STILL needs your attention, with who + where + \
+link. Do NOT list items you already answered (a [ME] reply that settles the ask). \
+If you replied but they're still waiting, list it and state what's still \
+outstanding (e.g. "replied with ETA, still owe them the actual fix").>
 
 *:speech_balloon: Needs a reply / follow-up*
 - <one line per item>
