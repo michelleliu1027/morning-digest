@@ -30,9 +30,12 @@ def _weekly_window(today: date) -> Window:
 
 def _daily_window(today: date) -> Window:
     prev = today - timedelta(days=1)
-    after = prev - timedelta(days=1)  # exclusive lower bound
-    before = today                     # exclusive upper bound -> just `prev`
-    return Window(mode="daily", after=after, before=before, label=prev.isoformat())
+    after = prev - timedelta(days=1)  # exclusive lower bound -> include `prev`
+    before = None                      # no upper bound -> up to NOW, so messages
+                                       # posted today (before you logged in) are
+                                       # caught too, not just yesterday's.
+    label = f"{prev.isoformat()} → {today.isoformat()}"
+    return Window(mode="daily", after=after, before=before, label=label)
 
 
 def compute_window(today: date | None = None, force_mode: str | None = None) -> Window:
