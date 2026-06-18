@@ -17,9 +17,11 @@ Requires (in .env):
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
+from dataclasses import asdict, fields
 from datetime import date, datetime
 from pathlib import Path
 
@@ -44,6 +46,13 @@ DASHBOARD_URL = f"http://127.0.0.1:{PORT}"
 DIGEST_HOUR = int(os.environ.get("DIGEST_HOUR", "8"))
 _STATE_DIR = Path(__file__).resolve().parents[3] / "digest_output"
 _LAST_SENT_FILE = _STATE_DIR / ".last_digest_date"
+# Posted tasks persisted to disk, keyed by task id. The in-memory _TASKS dict is
+# lost when the listener restarts (KeepAlive/login/crash) or when a one-off
+# process posts the digest — but the buttons in Slack live forever, so a click
+# can arrive at a process whose memory never held that task. This file lets any
+# process resolve a clicked task id back into a Task, so buttons never go dead.
+_TASKS_FILE = _STATE_DIR / ".posted_tasks.json"
+_TASKS_FILE_LOCK = threading.Lock()
 
 # Demo task set used by `--demo`. These are placeholders to show the shape of a
 # task; in real use tasks are generated from your digest. Edit them to point at
@@ -83,10 +92,52 @@ _TASKS: dict[str, Task] = {t.id: t for t in DEMO_TASKS}
 _MSG: dict[str, dict] = {}
 _MSG_LOCK = threading.Lock()
 
+# Only the Task dataclass fields are persisted (all JSON-safe strings); anything
+# extra in the file is ignored so an old file never breaks a newer Task shape.
+_TASK_FIELDS = {f.name for f in fields(Task)}
+
+
+def _persist_tasks(tasks: list[Task]) -> None:
+    """Merge the given tasks into the on-disk store so any process can resolve them."""
+    try:
+        with _TASKS_FILE_LOCK:
+            store: dict[str, dict] = {}
+            try:
+                store = json.loads(_TASKS_FILE.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError):
+                store = {}
+            for t in tasks:
+                store[t.id] = asdict(t)
+            _STATE_DIR.mkdir(parents=True, exist_ok=True)
+            _TASKS_FILE.write_text(json.dumps(store, ensure_ascii=False), encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001 - persistence is best-effort
+        print(f"[interactive] _persist_tasks failed: {exc}")
+
+
+def _get_task(tid: str) -> Task | None:
+    """Resolve a clicked task id: memory first, then the on-disk store.
+
+    The disk fallback is what keeps Slack buttons alive across restarts and
+    across the process that posted the digest exiting.
+    """
+    t = _TASKS.get(tid)
+    if t is not None:
+        return t
+    try:
+        store = json.loads(_TASKS_FILE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    spec = store.get(tid)
+    if not isinstance(spec, dict):
+        return None
+    t = Task(**{k: v for k, v in spec.items() if k in _TASK_FIELDS})
+    _TASKS[tid] = t  # warm the cache so the next click is in-memory
+    return t
+
 
 def _record_outcome(tid: str, state: str) -> None:
     """Persist a task's terminal outcome to the completion ledger (best-effort)."""
-    t = _TASKS.get(tid)
+    t = _get_task(tid)
     if not t:
         return
     try:
@@ -126,6 +177,26 @@ def _task_blocks(tasks: list[Task]) -> list[dict]:
     return blocks
 
 
+def _ensure_msg(body: dict) -> None:
+    """Warm _MSG from a click payload when this process didn't post the message.
+
+    Status edits rewrite blocks held in the in-memory _MSG dict, keyed by message
+    ts. That dict is empty when the listener restarts or when a one-off process
+    posted the digest — so a click would find no record and the row would never
+    flip to "Running…". The action payload carries the message's current blocks,
+    ts and channel, so we seed _MSG from it (only if missing — never clobber the
+    live record that already tracks in-place edits).
+    """
+    msg = body.get("message", {}) or {}
+    ts = msg.get("ts")
+    blocks = msg.get("blocks")
+    channel = (body.get("channel", {}) or {}).get("id")
+    if not (ts and blocks and channel):
+        return
+    with _MSG_LOCK:
+        _MSG.setdefault(ts, {"channel": channel, "blocks": blocks})
+
+
 def _set_task_status(client, message_ts: str, task_id: str, status_md: str) -> None:
     """Rewrite one task row's buttons into a status line, in place via chat_update.
 
@@ -161,6 +232,7 @@ def build_app() -> App:
     @app.action("skip_task")
     def handle_skip(ack, body, client):
         ack()
+        _ensure_msg(body)
         tid = body["actions"][0]["value"]
         _record_outcome(tid, "skipped")
         _set_task_status(client, body["message"]["ts"], tid, "⏭️ *Skipped*")
@@ -170,6 +242,7 @@ def build_app() -> App:
         # The user did this themselves before any agent ran. Same suppression
         # window as a real 'done' — the ledger stops it resurfacing for a week.
         ack()
+        _ensure_msg(body)
         tid = body["actions"][0]["value"]
         _record_outcome(tid, "finished")
         _set_task_status(client, body["message"]["ts"], tid, "✔️ *Already done by you*")
@@ -177,8 +250,9 @@ def build_app() -> App:
     @app.action("do_task")
     def handle_do(ack, body, client):
         ack()
+        _ensure_msg(body)
         tid = body["actions"][0]["value"]
-        task = _TASKS.get(tid)
+        task = _get_task(tid)
         channel = body["channel"]["id"]
         thread_ts = body["message"]["ts"]
         if not task:
@@ -287,6 +361,9 @@ def post_tasks(app: App, tasks: list[Task] | None = None) -> None:
     tasks = tasks or DEMO_TASKS
     for t in tasks:
         _TASKS[t.id] = t
+    # Persist so a click can be resolved even if THIS process is gone by then
+    # (a one-off post, or the listener restarting before you tap a button).
+    _persist_tasks(tasks)
     blocks = _task_blocks(tasks)
     resp = app.client.chat_postMessage(
         channel=os.environ["MY_SLACK_USER_ID"],
