@@ -26,6 +26,38 @@ def _run(args: list[str], cwd: str) -> tuple[int, str]:
     return proc.returncode, (proc.stdout + proc.stderr).strip()
 
 
+def _nothing_to_commit(out: str) -> bool:
+    """True when `git commit` failed only because there was nothing to commit.
+
+    This happens when the change is already on the branch (e.g. a prior approval
+    committed it, or the agent's run committed it). It is NOT an error — the work
+    is already in place — so callers treat it as "already done" instead of looping
+    the dashboard forever on a non-zero exit.
+    """
+    low = out.lower()
+    return ("nothing to commit" in low
+            or "nothing added to commit" in low      # scoped commit, other untracked files present
+            or "no changes added to commit" in low
+            or "working tree clean" in low)
+
+
+def _push(cwd: str, branch: str) -> tuple[int, str]:
+    """Push the branch, using gh as the credential helper so it works headless.
+
+    The server runs under launchd with no TTY/keychain, so a plain HTTPS push
+    fails with "could not read Username for 'https://github.com'". Injecting
+    `gh auth git-credential` as the helper (only for this invocation, via -c)
+    supplies the token gh already holds, without touching the repo's git config.
+    """
+    return _run(
+        ["git",
+         "-c", "credential.https://github.com.helper=",
+         "-c", "credential.https://github.com.helper=!gh auth git-credential",
+         "push", "-u", "origin", branch],
+        cwd,
+    )
+
+
 def current_branch(cwd: str) -> str:
     _, out = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd)
     return out.strip()
@@ -82,10 +114,12 @@ def commit_and_push(cwd: str, branch: str, commit_msg: str,
         return CommitResult(False, f"git add failed: {out}")
 
     code, out = _run(["git", "commit", "-m", commit_msg], cwd)
-    if code != 0:
+    # Already committed (a prior approval or the agent's run) → not an error; fall
+    # through to push so the existing commit still reaches the PR branch.
+    if code != 0 and not _nothing_to_commit(out):
         return CommitResult(False, f"git commit failed: {out}")
 
-    code, out = _run(["git", "push", "-u", "origin", branch], cwd)
+    code, out = _push(cwd, branch)
     if code != 0:
         return CommitResult(False, f"git push failed: {out}")
 
@@ -117,14 +151,21 @@ def commit_files(cwd: str, branch: str, files: list[str], commit_msg: str,
         return CommitResult(False, f"git add failed: {out}")
 
     code, out = _run(["git", "commit", "-m", commit_msg, "--", *files], cwd)
-    if code != 0:
+    # This file's change may already be committed (re-click, or the agent's run
+    # committed it). Treat that as already-done and still push, rather than
+    # bouncing the file back to "pending" and stranding the dashboard.
+    already = code != 0 and _nothing_to_commit(out)
+    if code != 0 and not already:
         return CommitResult(False, f"git commit failed: {out}")
 
-    code, out = _run(["git", "push", "-u", "origin", branch], cwd)
+    code, out = _push(cwd, branch)
     if code != 0:
         return CommitResult(False, f"git push failed: {out}")
 
     nfiles = len(files)
+    if already:
+        scope = f"#{existing_pr}'s branch `{branch}`" if existing_pr else f"`{branch}`"
+        return CommitResult(True, f"{nfiles} file(s) already committed → ensured pushed to {scope}.")
     if existing_pr is not None:
         return CommitResult(True, f"committed {nfiles} file(s) → pushed to #{existing_pr}'s branch `{branch}` (PR auto-updates).")
 
