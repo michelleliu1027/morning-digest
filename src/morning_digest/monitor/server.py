@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -34,6 +35,14 @@ from .gitops import (
 HOST = "127.0.0.1"
 PORT = 8787
 
+# Read-only Slack thread reader (morning_digest.slack_read), invoked by the
+# listener's own interpreter so it resolves regardless of the agent's cwd. This
+# is the ONLY Slack surface an agent may touch: it can READ the thread a task
+# came from (to pull context the digest dropped, e.g. IDs a teammate pasted) but
+# holds no token and cannot post. The command is allowlisted verbatim below.
+SLACK_READ_CMD = f"{sys.executable} -m morning_digest.slack_read"
+_SLACK_READ_TOOL = f"Bash({SLACK_READ_CMD}*)"
+
 # Read-only `gh` subcommands an analysis/draft agent may use. Deliberately a
 # per-subcommand allowlist (NOT the `gh *` wildcard) so the agent CANNOT post a
 # comment/review or merge — `gh pr comment`, `gh pr review`, `gh pr merge` and
@@ -47,7 +56,7 @@ _READONLY_GH = (
 
 # Tools a read-only / analysis agent may use without prompting.
 DEFAULT_ALLOWED_TOOLS = (
-    f"TodoWrite Read Grep {_READONLY_GH} "
+    f"TodoWrite Read Grep {_READONLY_GH} {_SLACK_READ_TOOL} "
     "Bash(ls *) Bash(find *) Bash(cat *) Bash(grep *) Bash(git diff*) Bash(git log*) "
     "mcp__notion__notion-search mcp__notion__notion-fetch"
 )
@@ -62,7 +71,7 @@ DRAFT_ALLOWED_TOOLS = DEFAULT_ALLOWED_TOOLS
 # after the user approves the diff in the dashboard. The gate is enforced here at
 # the tool level, not merely by the prompt.
 WRITER_ALLOWED_TOOLS = (
-    "TodoWrite Edit Write Read Grep "
+    f"TodoWrite Edit Write Read Grep {_SLACK_READ_TOOL} "
     "Bash(git status*) Bash(git diff*) Bash(git log*) Bash(git branch*) "
     "Bash(git checkout*) Bash(git switch*) Bash(git fetch*) Bash(git stash*) "
     "Bash(gh pr list*) Bash(gh pr view*) Bash(gh pr checkout*) "
@@ -131,6 +140,9 @@ class Agent:
             "drafts": self.drafts,
             "source": self.source,
             "source_url": self.source_url,
+            # The dashboard chat box only makes sense once the agent has stopped
+            # AND has a session to resume; surface that as one flag for the UI.
+            "can_chat": bool(self.session_id) and self.status in _CHATTABLE_STATES,
         }
 
 
@@ -249,6 +261,30 @@ def _with_pr_feedback(prompt: str, feedback: str) -> str:
     ) + prompt
 
 
+def _with_slack_source(prompt: str, source_url: str) -> str:
+    """If the task came from a Slack thread, tell the agent to read it first.
+
+    The digest distils a thread into a one-line task and drops the rest, so the
+    evidence the agent needs (IDs/links a teammate pasted, the precise ask) is
+    only in the thread. The agent can't reach Slack except through the read-only
+    `slack_read` tool, so point it at the exact permalink and require it to pull
+    the thread before acting.
+    """
+    if "/archives/" not in (source_url or ""):
+        return prompt  # not a Slack permalink (PR/Notion/none) — nothing to add
+    return (
+        "--- SLACK SOURCE (read it FIRST for full context) ---\n"
+        "This task was distilled from a Slack thread; the one-line task above may "
+        "be missing details that live in the thread (IDs, links, the exact ask). "
+        "Before you do anything else, run this read-only command and use what it "
+        "returns as primary context:\n"
+        f"  {SLACK_READ_CMD} '{source_url}'\n"
+        "If it returns an error or nothing useful, say so briefly and proceed with "
+        "what you have.\n"
+        "--- END SLACK SOURCE ---\n\n"
+    ) + prompt
+
+
 def spawn_agent(name: str, prompt: str, cwd: str = ".", model: str = "opus",
                 gate: str = "readonly", allowed_tools: str | None = None,
                 source: str = "", source_url: str = "") -> Agent:
@@ -269,16 +305,19 @@ def spawn_agent(name: str, prompt: str, cwd: str = ".", model: str = "opus",
     # the agent works the whole PR's feedback — not just the one issue the digest
     # mentioned. The agent has no `gh api`, so this is the only way it sees them.
     feedback = _fetch_pr_feedback(prompt, resolved_cwd) if gate in ("code", "draft") else ""
+    # Build the FULL prompt the agent runs: task + any PR feedback + a pointer to
+    # the Slack thread it came from. agent.prompt is the source of truth that gets
+    # run (not the bare `prompt` arg) so injected context actually reaches the CLI.
+    full_prompt = _with_slack_source(_with_pr_feedback(prompt, feedback), source_url)
     agent = Agent(id=uuid.uuid4().hex[:8], name=name,
-                  prompt=_with_pr_feedback(prompt, feedback),
-                  cwd=resolved_cwd, gate=gate)
+                  prompt=full_prompt, cwd=resolved_cwd, gate=gate)
     agent.allowed_tools = allowed_tools
     agent.model = model
     agent.pr_feedback = feedback
     agent.source = source
     agent.source_url = source_url
     REGISTRY.add(agent)
-    threading.Thread(target=_run_agent, args=(agent, prompt), daemon=True).start()
+    threading.Thread(target=_run_agent, args=(agent, agent.prompt), daemon=True).start()
     return agent
 
 
@@ -718,6 +757,47 @@ def rerun_with_hint(agent_id: str, hint: str) -> dict:
     return {"ok": True, "message": "re-running with hint"}
 
 
+# States a chat turn may resume from: anything that has stopped. (running would
+# collide with the live process; committing is a transient gate action.)
+_CHATTABLE_STATES = {"done", "failed", "needs_input", "awaiting_approval"}
+
+
+def chat_with_agent(agent_id: str, message: str) -> dict:
+    """Continue a finished agent as a follow-up chat turn on the SAME session.
+
+    This is the dashboard's "talk to Claude" box. Like rerun_with_hint it resumes
+    the claude session via --resume so the agent keeps everything it already saw
+    (the thread it read, the diff it made), but unlike rerun it works from any
+    stopped state — so you can ask a done analysis a follow-up, or tell a code
+    agent to also fix one more thing. The task's original gate/toolset is reused,
+    so a code task that edits again simply re-enters the diff-approval gate.
+    """
+    agent = REGISTRY.get(agent_id)
+    if agent is None:
+        return {"ok": False, "error": "agent not found"}
+    if agent.status == "running" or agent.status == "starting":
+        return {"ok": False, "error": "agent is still running — wait for it to finish"}
+    if agent.status not in _CHATTABLE_STATES:
+        return {"ok": False, "error": f"can't chat while agent is {agent.status}"}
+    if not agent.session_id:
+        return {"ok": False, "error": "no session id to resume"}
+    message = (message or "").strip()
+    if not message:
+        return {"ok": False, "error": "empty message"}
+
+    # Clear any prior gate state: this turn produces a fresh outcome (new diff,
+    # new analysis) that will re-park the agent if it's a code/draft task.
+    REGISTRY.set_note(agent, "")
+    REGISTRY.set_diff(agent, None)
+    REGISTRY.set_drafts(agent, None)
+    REGISTRY.push_event(agent, ProgressEvent("say", f"💬 you: {message}", "💬", full=message))
+    threading.Thread(
+        target=_run_agent, args=(agent, message),
+        kwargs={"resume_session": agent.session_id}, daemon=True,
+    ).start()
+    return {"ok": True, "message": "continuing the conversation"}
+
+
 # ---------------------------------------------------------------------------
 # HTTP layer: dashboard page + JSON API + SSE stream
 # ---------------------------------------------------------------------------
@@ -827,6 +907,14 @@ DASHBOARD_HTML = """<!doctype html>
   .hint textarea { width:100%; min-height:54px; resize:vertical; background:#0f1115; color:#e6e6e6; border:1px solid var(--line); border-radius:7px; padding:8px; font:13px system-ui; }
   .hint button { margin-top:8px; }
   button.rerun { background:#3a2a52; color:#e9d5ff; } button.rerun:hover{ background:#4a356a;}
+  /* chat box: talk to the agent (resumes its session) */
+  .chat { padding:12px 14px; background:#11151c; border-top:1px solid var(--line); }
+  .chat textarea { width:100%; min-height:46px; resize:vertical; background:#0f1115; color:#e6e6e6; border:1px solid var(--line); border-radius:7px; padding:8px; font:13px system-ui; }
+  .chat .crow { display:flex; gap:8px; align-items:center; margin-top:8px; }
+  .chat button { font:13px system-ui; padding:8px 16px; border-radius:7px; border:0; cursor:pointer; font-weight:600; background:#1d3b2a; color:#5fe39a; }
+  .chat button:hover { background:#244a35; }
+  .chat button:disabled { opacity:.5; cursor:default; }
+  .chat .hint-txt { font-size:11px; color:var(--dim); }
   .draft { padding:10px 14px; border-bottom:1px solid var(--line); }
   .draft .dh { font-size:11px; color:var(--muted); margin-bottom:5px; }
   .draft .dstatus { text-transform:uppercase; letter-spacing:.04em; }
@@ -1068,6 +1156,19 @@ function renderArt(){
   if(a.status==='running'){
     html += `<div class="gate-acts"><button class="stop" data-stop="${a.id}">⏹ Stop agent</button></div>`;
   }
+  // Talk to the agent: a follow-up turn resumes its session (it keeps everything
+  // it already saw). Shown once it has stopped and has a session to resume.
+  if(a.can_chat){
+    const hint = a.gate==='code' ? 'It keeps its context; edits re-enter the diff gate.'
+               : a.gate==='draft' ? 'It keeps its context; new drafts go to approval.'
+               : 'It keeps its context from this run.';
+    html += `<div class="chat">
+      <textarea id="chatBox" placeholder="Ask a follow-up or tell it what to do next…"></textarea>
+      <div class="crow">
+        <button data-chat="${a.id}">💬 Send to Claude</button>
+        <span class="hint-txt">${hint}</span>
+      </div></div>`;
+  }
   art.innerHTML = html || '<div class="empty" style="padding:30px">Nothing to show yet.</div>';
 }
 
@@ -1091,6 +1192,14 @@ document.body.addEventListener('click', ev=>{
     if(!hint){ alert('Type a hint first'); return; }
     rr.disabled=true; rr.textContent='re-running…';
     post('/rerun',{id:rr.dataset.rerun, hint}); return;
+  }
+  const ch = ev.target.closest('[data-chat]');
+  if(ch){
+    const box=document.getElementById('chatBox');
+    const message=(box&&box.value||'').trim();
+    if(!message){ alert('Type a message first'); return; }
+    ch.disabled=true; ch.textContent='sending…';
+    post('/chat',{id:ch.dataset.chat, message}); return;
   }
   const dm = ev.target.closest('[data-diffmode]');
   if(dm){ DIFFMODE=dm.dataset.diffmode; localStorage.setItem('diffmode',DIFFMODE); renderArt(); return; }
@@ -1231,6 +1340,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200 if res.get("ok") else 400, json.dumps(res).encode())
         elif self.path == "/rerun":
             res = rerun_with_hint(data.get("id", ""), data.get("hint", ""))
+            self._send(200 if res.get("ok") else 400, json.dumps(res).encode())
+        elif self.path == "/chat":
+            res = chat_with_agent(data.get("id", ""), data.get("message", ""))
             self._send(200 if res.get("ok") else 400, json.dumps(res).encode())
         elif self.path == "/approve-file":
             res = approve_file(data.get("id", ""), data.get("path", ""), data.get("commit_msg"))
