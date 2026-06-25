@@ -247,6 +247,26 @@ def build_app() -> App:
         _record_outcome(tid, "finished")
         _set_task_status(client, body["message"]["ts"], tid, "✔️ *Already done by you*")
 
+    @app.action("confirm_done")
+    def handle_confirm_done(ack, body, client):
+        # The agent already ran; the user is now confirming the result actually
+        # resolves the task. ONLY here do we record 'done' — that is what makes the
+        # next digest skip it. Without this click nothing is suppressed.
+        ack()
+        _ensure_msg(body)
+        tid = body["actions"][0]["value"]
+        _record_outcome(tid, "done")
+        _set_confirm_status(client, body, tid, "✅ *Confirmed resolved* — won't resurface")
+
+    @app.action("not_resolved")
+    def handle_not_resolved(ack, body, client):
+        # The agent ran but didn't actually settle it. Record NOTHING, so the task
+        # returns on the next digest (its source still persists).
+        ack()
+        _ensure_msg(body)
+        tid = body["actions"][0]["value"]
+        _set_confirm_status(client, body, tid, "🔄 *Kept* — will appear again next digest")
+
     @app.action("do_task")
     def handle_do(ack, body, client):
         ack()
@@ -335,9 +355,12 @@ def _report_when_done(client, channel: str, thread_ts: str, agent_id: str,
     if tid:
         elapsed = agent.public()["elapsed"]
         if agent.status == "done":
-            _set_task_status(client, thread_ts, tid, f"✅ *Done* · {elapsed}s")
-            # Record success so the next digest won't resurface it for a week.
-            _record_outcome(tid, "done")
+            # The agent finished, but "the agent ran" is NOT the same as "the task
+            # is resolved" — it may have only drafted a query or picked the wrong
+            # angle. So DON'T record to the ledger here; ask the user to confirm.
+            # Only confirm_done records it (and thus suppresses the next digest).
+            _set_task_status(client, thread_ts, tid,
+                             f"✅ *Agent done* · {elapsed}s — confirm below")
         else:
             _set_task_status(client, thread_ts, tid, f"❌ *Failed* · {elapsed}s")
 
@@ -350,10 +373,55 @@ def _report_when_done(client, channel: str, thread_ts: str, agent_id: str,
         "draft": "→ Draft is in the dashboard; send it once you've okayed it.",
         "readonly": "→ Read-only analysis; results in the dashboard.",
     }.get(task.gate, "")
-    client.chat_postMessage(
-        channel=channel, thread_ts=thread_ts,
+    blocks = None
+    if ok and tid:
+        # Confirmation gate: nothing is suppressed until the user says it's resolved.
+        blocks = [
+            {"type": "section", "text": {"type": "mrkdwn",
+             "text": f"{head}: *{task.title}* ({agent.public()['elapsed']}s)\n{summary}\n{note}\n\n"
+                     "_Did this actually resolve it? Confirm so I don't resurface it; "
+                     "otherwise it stays on tomorrow's list._"}},
+            {"type": "actions", "block_id": f"confirm_{tid}", "elements": [
+                {"type": "button", "text": {"type": "plain_text", "text": "✅ Resolved — don't resurface"},
+                 "style": "primary", "action_id": "confirm_done", "value": tid},
+                {"type": "button", "text": {"type": "plain_text", "text": "🔄 Not resolved — keep it"},
+                 "action_id": "not_resolved", "value": tid},
+            ]},
+        ]
+    resp = client.chat_postMessage(
+        channel=channel, thread_ts=thread_ts, blocks=blocks,
         text=f"{head}: *{task.title}* ({agent.public()['elapsed']}s)\n{summary}\n{note}",
     )
+    # Remember this message so the confirm/not-resolved click can rewrite it in place.
+    if blocks:
+        with _MSG_LOCK:
+            _MSG[resp["ts"]] = {"channel": resp["channel"], "blocks": blocks}
+
+
+def _set_confirm_status(client, body: dict, tid: str, status_md: str) -> None:
+    """Swap the confirm/not-resolved buttons for a final status line, in place.
+
+    The completion message carries an `actions` block with block_id `confirm_<id>`;
+    once the user picks resolved/kept we replace it with a context line so the
+    buttons can't be tapped twice.
+    """
+    msg = body.get("message", {}) or {}
+    ts = msg.get("ts")
+    channel = (body.get("channel", {}) or {}).get("id")
+    blocks = msg.get("blocks")
+    if not (ts and channel and blocks):
+        return
+    new_blocks = []
+    for b in blocks:
+        if b.get("type") == "actions" and b.get("block_id") == f"confirm_{tid}":
+            new_blocks.append({"type": "context", "block_id": f"confirm_{tid}",
+                               "elements": [{"type": "mrkdwn", "text": status_md}]})
+        else:
+            new_blocks.append(b)
+    try:
+        client.chat_update(channel=channel, ts=ts, blocks=new_blocks, text="Task confirmation")
+    except Exception as exc:  # noqa: BLE001 - cosmetic; never crash a click
+        print(f"[interactive] confirm chat_update failed: {exc}")
 
 
 def post_tasks(app: App, tasks: list[Task] | None = None) -> None:
@@ -375,6 +443,29 @@ def post_tasks(app: App, tasks: list[Task] | None = None) -> None:
         _MSG[resp["ts"]] = {"channel": resp["channel"], "blocks": blocks}
 
 
+def _extract_slack_candidates(runner, win, slack_messages: str) -> str:
+    """Stage 1: enumerate every actionable Slack item, de-firehosed for stage 2.
+
+    Returns the candidate list (the text after CANDIDATES_MARKER). On any failure
+    or empty Slack input, returns "" so post_live_digest falls back to feeding the
+    raw messages straight to the digest pass (no worse than the old behaviour).
+    """
+    from ..prompt import CANDIDATES_MARKER, build_extract_prompt
+
+    if not slack_messages or "(no Slack activity" in slack_messages:
+        return ""
+    try:
+        raw = runner.run_claude(
+            build_extract_prompt(window=win.label, slack_messages=slack_messages)
+        )
+    except Exception as exc:  # noqa: BLE001 - never let triage crash the digest
+        print(f"[interactive] slack triage failed, using raw messages: {exc}")
+        return ""
+    if CANDIDATES_MARKER in raw:
+        raw = raw.partition(CANDIDATES_MARKER)[2]
+    return raw.strip()
+
+
 def post_live_digest(app: App, mode: str | None = None) -> None:
     """Build the real digest (with actionable tasks), post it, then the buttons.
 
@@ -384,7 +475,7 @@ def post_live_digest(app: App, mode: str | None = None) -> None:
     # Imported lazily so the demo path doesn't require the full digest deps.
     from datetime import date
 
-    from ..prompt import build_prompt
+    from ..prompt import build_extract_prompt, build_prompt
     from ..slack_format import to_slack_blocks, to_slack_mrkdwn
     from ..window import compute_window
     from .. import __main__ as runner
@@ -401,10 +492,16 @@ def post_live_digest(app: App, mode: str | None = None) -> None:
         user_id, after=win.after, before=win.before,
         include_sent=True,
     )
+    # Two-stage distillation: a single pass over the raw firehose (hundreds of
+    # messages across ~20 channels) silently drops items buried in quiet threads.
+    # Stage 1 walks every channel exhaustively and emits a flat candidate list;
+    # stage 2 builds the digest from that compact list so nothing gets lost.
+    slack_candidates = _extract_slack_candidates(runner, win, slack_messages)
     prompt = build_prompt(
         mode=win.mode, today=today.isoformat(), window=win.label,
         slack_messages=slack_messages, with_actions=True,
         already_handled=ledger.format_for_prompt(),
+        slack_candidates=slack_candidates,
     )
     raw = runner.run_claude(prompt)
     digest_text, tasks = split_digest_and_tasks(raw)

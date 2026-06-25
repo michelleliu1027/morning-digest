@@ -19,6 +19,7 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
 USER_TOKEN_ENV = "SLACK_MORNING_TASKS_DIGEST_USER_TOKEN"
+BOT_TOKEN_ENV = "SLACK_MORNING_TASKS_DIGEST_BOT_TOKEN"
 
 # search.messages caps page size at 100; paginate up to this many pages per query.
 _PER_PAGE = 100
@@ -30,6 +31,24 @@ def _client() -> WebClient | None:
     if not token:
         return None
     return WebClient(token=token)
+
+
+def _bot_user_id() -> str | None:
+    """The digest bot's own Slack user id, so we can drop its own posts.
+
+    The bot DMs the user a "🚀 Started / ❌ Failed / 🌅 Today's tasks" message for
+    every click. Those land in the same DM the next digest searches, so without
+    this they get re-ingested as "activity" — a feedback loop that buries (and
+    misleads the model about) the real request the task came from. Identifying
+    the bot by user id lets us strip its posts no matter which channel they're in.
+    """
+    token = os.environ.get(BOT_TOKEN_ENV)
+    if not token:
+        return None
+    try:
+        return WebClient(token=token).auth_test().get("user_id")
+    except SlackApiError:
+        return None
 
 
 def _search_all(client: WebClient, query: str) -> list[dict]:
@@ -88,12 +107,19 @@ def fetch_messages(
     if include_sent:
         streams.append(("i-said", f"from:me {win}"))
 
+    bot_uid = _bot_user_id()
+
     # channel -> list of (ts, kind, sender, text, permalink)
     by_channel: dict[str, list[tuple]] = {}
     seen: set[str] = set()
     try:
         for kind, query in streams:
             for m in _search_all(client, query):
+                # Drop the digest bot's own posts (🚀 Started / ❌ Failed / the
+                # digest itself). They live in the same DM this search scans, so
+                # re-ingesting them creates a feedback loop and misleads the model.
+                if bot_uid and m.get("user") == bot_uid:
+                    continue
                 ch = m.get("channel", {})
                 ch_id = ch.get("id", "") if isinstance(ch, dict) else ""
                 ts = m.get("ts", "")

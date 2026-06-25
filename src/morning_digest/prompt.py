@@ -2,6 +2,47 @@
 
 import os
 
+# Marker that separates stage-1 triage prose from the candidate list.
+CANDIDATES_MARKER = "<<<CANDIDATES>>>"
+
+# Stage 1 of two-stage distillation. A single digest pass over hundreds of raw
+# Slack messages (469 across 22 channels in practice) silently drops items that
+# live in low-traffic threads — a 7-message group DM ranks below the busy PR
+# channels and loses the model's attention, so a real ask (e.g. verify a
+# partner's device IDs) never becomes a task. This pass does ONE job: walk every
+# channel exhaustively and enumerate every actionable item, with no count cap, so
+# nothing gets dropped for being in a quiet thread. Stage 2 then triages this
+# clean, compact list instead of the raw firehose.
+_SLACK_EXTRACT = """\
+You are triaging a user's Slack activity so that NOTHING actionable slips through.
+
+Below are ALL of the user's Slack messages in the window ({window}), grouped by \
+channel: @mentions of them, DMs to them, and the user's OWN replies (tagged [ME]).
+
+Walk through EVERY channel and EVERY thread — INCLUDING low-traffic group DMs with \
+only a handful of messages. For each distinct ask, request, question, or commitment \
+directed at OR made by the user, emit one candidate line. Do NOT merge separate \
+threads into one item, do NOT cap the number of items, and do NOT skip a thread \
+because it is small or looks minor. Being exhaustive matters far more than being \
+concise here — a missed item is the failure mode.
+
+Classify each candidate with a STATUS:
+  - OPEN_ASK        : someone asked the user something and there is NO [ME] reply yet
+  - OWED_FOLLOWUP   : the user replied but the other person is still waiting (a \
+promised deliverable not sent, an unanswered point)
+  - INTENT_NOT_DONE : a [ME] reply states a PLAN or intent but not the actual \
+result — e.g. "haven't had a chance to check, but I think it's in table X", "will \
+run a query on…", "my guess is…". The user committed to work they have NOT done. \
+These are PRIME agent tasks.
+  - HANDLED         : the user already delivered the actual answer/result; nothing left
+
+IGNORE automated/bot messages (including this digest bot's own past posts).
+
+Output ONLY a line containing `{marker}` then, one item per line in this exact form:
+[STATUS] one-sentence summary of the ask/commitment — who, #channel — <permalink or ->
+
+List every non-trivial item you found. Output nothing after the list."""
+
 # Sources Claude gathers itself via tools (Notion MCP + gh CLI).
 _SOURCES = """\
 ## Sources to gather
@@ -29,6 +70,14 @@ deliverable not yet sent, an unanswered point), list it as awaiting follow-up an
 say specifically what is still outstanding. Only list an item as needing a reply \
 if there is NO [ME] response to it at all. IGNORE automated/bot messages (including \
 this digest bot's own past messages).
+
+   A [ME] reply only counts as "settles the ask" when it delivers the actual \
+answer/result. A reply that states an INTENT or a PLAN but not the work itself — \
+e.g. "I haven't had a chance to check yet, but I think it's in table X", "will \
+look into this", "my guess is…", "I'll run a query on…" — does NOT settle it. The \
+user committed to doing something they have not yet done. These are the BEST \
+candidates to hand to an agent: surface them (and emit them as actionable tasks), \
+phrased as the concrete thing the user said they'd do.
 """
 
 _DAILY_OUTPUT = """\
@@ -133,8 +182,24 @@ Output the JSON array and nothing after it. If there are no good tasks, output \
 """
 
 
+def build_extract_prompt(window: str, slack_messages: str) -> str:
+    """Stage 1: ask the model to exhaustively enumerate every actionable Slack item.
+
+    Returns a prompt whose output (after CANDIDATES_MARKER) is a flat,
+    de-firehosed candidate list that stage 2 (build_prompt) consumes instead of
+    the raw per-channel message dump.
+    """
+    head = _SLACK_EXTRACT.format(window=window, marker=CANDIDATES_MARKER)
+    body = (
+        "\n\n## Slack messages (lookback: "
+        f"{window})\n\n{slack_messages or '(none / Slack source not configured)'}\n"
+    )
+    return head + body
+
+
 def build_prompt(mode: str, today: str, window: str, slack_messages: str,
-                 with_actions: bool = False, already_handled: str = "") -> str:
+                 with_actions: bool = False, already_handled: str = "",
+                 slack_candidates: str = "") -> str:
     """Assemble the full prompt for the given mode ('daily' or 'weekly').
 
     When ``with_actions`` is set, the digest is followed by a `<<<TASKS>>>`
@@ -142,6 +207,12 @@ def build_prompt(mode: str, today: str, window: str, slack_messages: str,
 
     ``already_handled`` is an optional block (from the completion ledger) listing
     tasks the user already acted on, so the model does not resurface them.
+
+    ``slack_candidates`` is the stage-1 triage output (see build_extract_prompt).
+    When provided it REPLACES the raw per-channel Slack dump: stage 1 already
+    walked every channel exhaustively, so stage 2 reasons over the compact,
+    de-firehosed list and can't lose a quiet thread in the noise. Falls back to
+    the raw ``slack_messages`` when no candidate list is given.
     """
     output = _WEEKLY_OUTPUT if mode == "weekly" else _DAILY_OUTPUT
     # Optional: personalize with the user's name; otherwise stay generic ("your").
@@ -153,10 +224,20 @@ def build_prompt(mode: str, today: str, window: str, slack_messages: str,
         f"You are building {whose} {kind} "
         f"for today ({today}). Gather what's on {plate}, then produce ONE concise digest.\n"
     )
-    slack_block = (
-        "\n## Slack messages already fetched (lookback: "
-        f"{window})\n\n{slack_messages or '(none / Slack source not configured)'}\n"
-    )
+    if slack_candidates:
+        slack_block = (
+            "\n## Slack items — already triaged (lookback: "
+            f"{window})\n\nThese were extracted by an exhaustive first pass over "
+            "every channel; each line is one actionable item with its STATUS. "
+            "Treat this as the COMPLETE set of Slack work — do not assume anything "
+            "is missing, and do not drop OPEN_ASK / OWED_FOLLOWUP / INTENT_NOT_DONE "
+            f"items.\n\n{slack_candidates}\n"
+        )
+    else:
+        slack_block = (
+            "\n## Slack messages already fetched (lookback: "
+            f"{window})\n\n{slack_messages or '(none / Slack source not configured)'}\n"
+        )
     return (
         intro
         + _SOURCES

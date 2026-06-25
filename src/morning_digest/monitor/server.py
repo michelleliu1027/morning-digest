@@ -273,7 +273,7 @@ def _with_slack_source(prompt: str, source_url: str) -> str:
     if "/archives/" not in (source_url or ""):
         return prompt  # not a Slack permalink (PR/Notion/none) — nothing to add
     return (
-        "--- SLACK SOURCE (read it FIRST for full context) ---\n"
+        "=== SLACK SOURCE (read it FIRST for full context) ===\n"
         "This task was distilled from a Slack thread; the one-line task above may "
         "be missing details that live in the thread (IDs, links, the exact ask). "
         "Before you do anything else, run this read-only command and use what it "
@@ -281,7 +281,7 @@ def _with_slack_source(prompt: str, source_url: str) -> str:
         f"  {SLACK_READ_CMD} '{source_url}'\n"
         "If it returns an error or nothing useful, say so briefly and proceed with "
         "what you have.\n"
-        "--- END SLACK SOURCE ---\n\n"
+        "=== END SLACK SOURCE ===\n\n"
     ) + prompt
 
 
@@ -326,8 +326,12 @@ def _run_agent(agent: Agent, prompt: str, resume_session: str | None = None) -> 
 
     Used for both the first spawn and a `--resume` re-run with a correcting hint.
     """
+    # Pass the prompt on stdin, not as an argv. `claude -p <prompt>` treats a
+    # prompt that starts with `-`/`--` (e.g. an injected "--- SLACK SOURCE ---"
+    # header) as an unknown CLI option and dies at startup. stdin sidesteps argv
+    # parsing entirely, so no prompt content can ever masquerade as a flag.
     cmd = [
-        "claude", "-p", prompt,
+        "claude", "-p",
         "--model", agent.model,
         "--output-format", "stream-json", "--verbose",
         "--permission-mode", "acceptEdits",
@@ -337,13 +341,28 @@ def _run_agent(agent: Agent, prompt: str, resume_session: str | None = None) -> 
         cmd += ["--resume", resume_session]
     try:
         proc = subprocess.Popen(
-            cmd, cwd=agent.cwd, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, bufsize=1,
+            cmd, cwd=agent.cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, bufsize=1,
         )
+        proc.stdin.write(prompt)
+        proc.stdin.close()
     except FileNotFoundError:
         REGISTRY.push_event(agent, ProgressEvent("done", "claude CLI not found on PATH", "❌"))
         REGISTRY.set_status(agent, "failed")
         return
+
+    # Drain stderr in a thread so a full pipe can't deadlock the stdout loop, and
+    # so an early `claude` exit (dies at startup with no stdout) still leaves a
+    # reason to show instead of a blank pane.
+    stderr_tail: list[str] = []
+
+    def _drain_stderr() -> None:
+        for ln in proc.stderr:
+            stderr_tail.append(ln)
+            del stderr_tail[:-50]  # keep only the last 50 lines
+
+    err_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    err_thread.start()
 
     agent.proc = proc
     REGISTRY.set_status(agent, "running")
@@ -360,7 +379,10 @@ def _run_agent(agent: Agent, prompt: str, resume_session: str | None = None) -> 
                 agent.session_id = ev.meta["session_id"]
             REGISTRY.push_event(agent, ev)
     rc = proc.wait()
+    err_thread.join(timeout=2)
     if rc != 0:
+        why = "".join(stderr_tail).strip() or f"claude exited with code {rc} (no output — likely a transient startup failure; try again)"
+        REGISTRY.push_event(agent, ProgressEvent("done", why, "❌"))
         REGISTRY.set_status(agent, "failed")
         return
     if agent.gate == "code":
